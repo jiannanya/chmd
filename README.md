@@ -1,17 +1,19 @@
 # chmd
 
-`chmd` 是一个零运行时依赖、C++20、UTF-8 优先的 CommonMark 解析库。核心为完全独立的自研实现，采用两遍解析策略并提供高效的回调接口。
+**English** | [简体中文](README.zh-CN.md)
 
-当前版本严格实现 CommonMark 0.31.2，并通过官方 `spec.json` 的全部 **652/652** 个示例。库同时提供：
+`chmd` is a zero-runtime-dependency, C++20, UTF-8-first CommonMark parser. Its core is an entirely independent implementation built around a two-pass parsing strategy and an efficient callback interface.
 
-- 索引化紧凑 AST；
-- SAX 风格的进入、离开、文本回调，以及稳定的行式事件输出；
-- CommonMark HTML 渲染；
-- 命令行工具，支持 `html`、`ast`、`events` 三种输出；
-- 输入字节数、节点数、嵌套深度限制和可选严格 UTF-8 校验；
-- 官方规范测试、单元测试、确定性混合边界测试、对抗性退化测试和 libFuzzer 入口。
+The current release strictly implements CommonMark 0.31.2 and passes all **652/652** examples in the official `spec.json` fixture. The library provides:
 
-## 构建
+- A compact, index-based AST;
+- SAX-style enter, leave, and text callbacks, plus stable line-oriented event output;
+- CommonMark HTML rendering;
+- A command-line tool with `html`, `ast`, and `events` output modes;
+- Configurable input-size, node-count, and nesting-depth limits, with optional strict UTF-8 validation;
+- Official conformance tests, unit tests, deterministic mixed-boundary tests, adversarial complexity tests, and a libFuzzer entry point.
+
+## Building
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -19,15 +21,15 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-项目只要求 CMake 3.20+ 和 C++20 编译器。运行库不依赖正则库、ICU、第三方 Markdown 实现或动态数据文件。官方规范测试需要 Python 3；没有 Python 时仍可构建库和原生测试。
+The project requires only CMake 3.20 or newer and a C++20 compiler. The runtime library does not depend on a regular-expression library, ICU, another Markdown implementation, or external data files. Python 3 is required only for the official conformance suite; the library and native tests can still be built without it.
 
-常用构建开关：
+Common build options:
 
 ```text
-CHMD_BUILD_TESTS=ON          构建单元、边界和规范测试
-CHMD_BUILD_BENCHMARKS=OFF   构建 1 MiB 微基准
-CHMD_ENABLE_SANITIZERS=OFF  Linux/macOS 启用 ASan+UBSan；MSVC 启用 ASan；Windows Clang 启用 UBSan
-CHMD_BUILD_FUZZER=OFF       Clang 下构建 libFuzzer 目标
+CHMD_BUILD_TESTS=ON          Build unit, boundary, and conformance tests
+CHMD_BUILD_BENCHMARKS=OFF   Build the 1 MiB microbenchmark
+CHMD_ENABLE_SANITIZERS=OFF  ASan+UBSan on Linux/macOS; ASan on MSVC; UBSan on Windows Clang
+CHMD_BUILD_FUZZER=OFF       Build the libFuzzer target with Clang
 ```
 
 ## C++ API
@@ -49,23 +51,23 @@ int main() {
 }
 ```
 
-`Document` 使用一个连续 `std::vector<Node>` 作为节点 arena。父子和兄弟关系均为 32 位索引，移动文档不会让节点关系失效，也没有每个节点单独分配的子节点容器。源文本仅规范化并保存一份；CRLF/CR 统一为 LF，NUL 按规范替换为 U+FFFD。
+`Document` stores nodes in one contiguous `std::vector<Node>` arena. Parent, child, and sibling relationships use 32-bit indices, so moving a document does not invalidate its tree relationships and nodes do not need individually allocated child containers. Source text is normalized and stored once: CRLF and CR become LF, while NUL is replaced with U+FFFD as required by the specification.
 
-需要结构化流时，可继承 `EventHandler` 并调用 `Parser::parse_events()`。回调顺序严格嵌套：非文本节点收到 `enter` / `leave`，文本、代码、换行和原始 HTML 收到 `text`。
+For structured streaming, derive from `EventHandler` and call `Parser::parse_events()`. Callbacks are strictly nested: non-text nodes receive `enter` and `leave`, while text, code, line breaks, and raw HTML receive `text`.
 
-## 命令行
+## Command line
 
 ```sh
 chmd --to html README.md
 chmd --to ast document.md
 chmd --to events document.md
-chmd --safe untrusted.md       # 转义原始 HTML
-chmd --validate-utf8 input.md  # 拒绝非法 UTF-8
+chmd --safe untrusted.md       # Escape raw HTML
+chmd --validate-utf8 input.md  # Reject invalid UTF-8
 ```
 
-不指定文件或使用 `-` 时从标准输入读取。Windows 下标准输入输出以二进制模式打开，因此 HTML 与规范测试始终使用 LF，不被 CRT 改写成 CRLF。
+When no file is specified, or when the input is `-`, the command reads from standard input. On Windows, standard input and output use binary mode so HTML and conformance results retain LF line endings instead of being rewritten to CRLF by the CRT.
 
-事件输出示例：
+Example event output:
 
 ```text
 enter document
@@ -78,19 +80,19 @@ leave paragraph
 leave document
 ```
 
-## 实现与性能取向
+## Implementation and performance
 
-解析分为块级和行内两层：块级扫描维护开放容器栈，行内扫描维护强调/链接定界符栈。反引号运行预索引，强调匹配记录 opener 下界，避免常见的重复全串回扫。制表符按 4 列 tab stop 参与结构判断；跨越结构边界时未消费的列会回流为内容空格。
+Parsing is divided into block and inline passes. The block scanner maintains a stack of open containers; the inline scanner maintains delimiter stacks for emphasis and links. Backtick runs are pre-indexed, and emphasis matching records lower bounds for opener searches to avoid repeated whole-input rescans. Tabs participate in structural parsing at four-column tab stops, and unconsumed columns crossing structural boundaries are returned to the content as spaces.
 
-优先级按“性能、内存、产物空间”排序：
+The implementation priorities are performance first, memory use second, and binary/source footprint third:
 
-1. ASCII 热路径使用手写扫描器，不使用 `std::regex`；
-2. AST 采用连续 arena 和索引关系，避免指针树的碎片化分配；
-3. HTML5 实体、Unicode 空白/标点和 case-fold 表在构建前生成并以排序紧凑表编译进库；
-4. 运行时无外部数据文件，核心源代码和生成表保持在数百 KiB 量级；
-5. `ParseOptions` 可为不可信输入设置资源上限。
+1. Hand-written scanners handle ASCII hot paths without `std::regex`;
+2. The AST uses a contiguous arena and index relationships to avoid pointer-tree allocation fragmentation;
+3. HTML5 entities and Unicode whitespace, punctuation, and case-folding data are generated before compilation and stored as compact sorted tables;
+4. The runtime needs no external data files, while the core source and generated tables remain within a few hundred KiB;
+5. `ParseOptions` supplies resource limits for untrusted input.
 
-运行本机微基准：
+Run the local microbenchmark with:
 
 ```sh
 cmake -S . -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHMD_BUILD_BENCHMARKS=ON
@@ -98,22 +100,22 @@ cmake --build build-bench --parallel
 ./build-bench/chmd_benchmark
 ```
 
-微基准会重复解析约 1 MiB 的标题、列表、链接、强调、代码跨度和实体混合输入，并输出 MiB/s。它不把 HTML 序列化耗时混入解析数字。
+The benchmark repeatedly parses approximately 1 MiB of mixed headings, lists, links, emphasis, code spans, and entities, then reports throughput in MiB/s. HTML serialization time is intentionally excluded from the parsing result.
 
-## 测试与规范来源
+## Tests and specification fixture
 
-- `tests/spec.json`：CommonMark 0.31.2 官方 652 个示例；
-- `tests/test_main.cpp`：公共 API、主要语义和错误限制单元测试；
-- `tests/test_boundaries.cpp`：树关系不变量、2500 组确定性随机混合字节、深度/节点限制和对抗性输入；
-- `tests/fuzz_parser.cpp`：解析及三种输出的 libFuzzer 入口；
-- `tools/generate_tables.py`：可重复生成 HTML5 实体和 Unicode 分类/折叠表。
+- `tests/spec.json`: all 652 official CommonMark 0.31.2 examples;
+- `tests/test_main.cpp`: public API, core semantics, and error-limit unit tests;
+- `tests/test_boundaries.cpp`: tree invariants, 2,500 deterministic mixed-byte cases, depth/node limits, and adversarial input;
+- `tests/fuzz_parser.cpp`: libFuzzer entry point covering parsing and all three output formats;
+- `tools/generate_tables.py`: reproducible HTML5 entity and Unicode classification/folding table generation.
 
-规范测试数据的版权与归属说明见 [tests/README.md](tests/README.md)。
+Copyright and attribution information for the conformance fixture is available in [tests/README.md](tests/README.md).
 
-## 安全说明
+## Security
 
-CommonMark 允许原始 HTML，默认 HTML 渲染会原样保留它。处理不可信 Markdown 且输出将进入网页时，请启用 `HtmlOptions::escape_raw_html` 或 CLI 的 `--safe`。该选项只负责原始 HTML；URL 协议白名单、CSP 和应用层内容策略仍由调用方决定。
+CommonMark permits raw HTML, and the default HTML renderer preserves it. When rendering untrusted Markdown for use on a web page, enable `HtmlOptions::escape_raw_html` or pass `--safe` to the CLI. This option handles raw HTML only; URL-scheme allowlists, CSP, and application-level content policies remain the caller's responsibility.
 
-## 许可证
+## License
 
-chmd 自研代码采用 MIT 许可证。CommonMark 规范测试夹具沿用其上游许可，详见测试目录说明。
+The independently developed chmd source is licensed under the MIT License. The CommonMark conformance fixture retains its upstream license; see the test directory notice for details.
