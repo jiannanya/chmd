@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(chmd VERSION 1.0.0 LANGUAGES CXX)
+project(chmd VERSION 1.1.0 LANGUAGES CXX)
 
 option(CHMD_BUILD_TESTS "Build the test suite" ON)
 option(CHMD_BUILD_BENCHMARKS "Build the micro-benchmark" OFF)
@@ -90,20 +90,24 @@ if(CHMD_BUILD_TESTS)
     add_executable(chmd_boundary_tests tests/test_boundaries.cpp)
     target_link_libraries(chmd_boundary_tests PRIVATE chmd::chmd)
     add_test(NAME chmd_boundaries COMMAND chmd_boundary_tests)
-    set_tests_properties(chmd_unit chmd_boundaries PROPERTIES TIMEOUT 60)
+    add_executable(chmd_extension_tests tests/test_extensions.cpp)
+    target_link_libraries(chmd_extension_tests PRIVATE chmd::chmd)
+    add_test(NAME chmd_extensions COMMAND chmd_extension_tests)
+    set_tests_properties(chmd_unit chmd_boundaries chmd_extensions PROPERTIES TIMEOUT 60)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spec.json")
         add_test(NAME chmd_commonmark_0_31_2
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_spec.py
                     --program $<TARGET_FILE:chmd_cli>
+                    --program-arg=--commonmark
                     --spec ${CMAKE_CURRENT_SOURCE_DIR}/tests/spec.json)
         set_tests_properties(chmd_commonmark_0_31_2 PROPERTIES TIMEOUT 120)
     endif()
     if(CHMD_ENABLE_SANITIZERS AND MSVC)
         # Some recent Windows CRT builds expose non-interceptable thunks. ASan
         # can safely continue after reporting those startup-only misses.
-        set_tests_properties(chmd_unit chmd_boundaries PROPERTIES
+        set_tests_properties(chmd_unit chmd_boundaries chmd_extensions PROPERTIES
             ENVIRONMENT "ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1")
         if(TEST chmd_commonmark_0_31_2)
             set_tests_properties(chmd_commonmark_0_31_2 PROPERTIES

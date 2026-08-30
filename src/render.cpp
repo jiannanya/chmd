@@ -65,6 +65,16 @@ std::string percent_encode_url(std::string_view url) {
     return out;
 }
 
+std::string_view alignment_name(TableAlignment alignment) noexcept {
+    switch (alignment) {
+    case TableAlignment::left: return "left";
+    case TableAlignment::center: return "center";
+    case TableAlignment::right: return "right";
+    case TableAlignment::none: return "none";
+    }
+    return "none";
+}
+
 class HtmlRenderer {
 public:
     HtmlRenderer(const Document& document, HtmlOptions options)
@@ -86,6 +96,49 @@ private:
         const auto& parent = document_.node(node.parent);
         if (parent.type != NodeType::item || parent.parent == npos) return false;
         return document_.node(parent.parent).tight;
+    }
+
+    void render_checkbox(const Node& item) {
+        out_ += "<input";
+        if (item.checked) out_ += " checked=\"\"";
+        out_ += " disabled=\"\" type=\"checkbox\"> ";
+    }
+
+    void render_table_row(NodeId id, bool header) {
+        const auto& row = document_.node(id);
+        out_ += "<tr>\n";
+        for (auto cell_id = row.first_child; cell_id != npos; cell_id = document_.node(cell_id).next) {
+            const auto& cell = document_.node(cell_id);
+            out_ += header ? "<th" : "<td";
+            if (cell.alignment != TableAlignment::none) {
+                out_ += " align=\"";
+                out_ += alignment_name(cell.alignment);
+                out_ += "\"";
+            }
+            out_ += ">";
+            render_children_inline(cell);
+            out_ += header ? "</th>\n" : "</td>\n";
+        }
+        out_ += "</tr>\n";
+    }
+
+    void render_table(const Node& table) {
+        out_ += "<table>\n";
+        const auto head = table.first_child;
+        if (head != npos) {
+            out_ += "<thead>\n";
+            for (auto row = document_.node(head).first_child; row != npos; row = document_.node(row).next)
+                render_table_row(row, true);
+            out_ += "</thead>\n";
+            const auto body = document_.node(head).next;
+            if (body != npos && document_.node(body).first_child != npos) {
+                out_ += "<tbody>\n";
+                for (auto row = document_.node(body).first_child; row != npos; row = document_.node(row).next)
+                    render_table_row(row, false);
+                out_ += "</tbody>\n";
+            }
+        }
+        out_ += "</table>\n";
     }
 
     void render_item(const Node& item) {
@@ -157,8 +210,16 @@ private:
             break;
         case NodeType::paragraph:
             if (!tight_paragraph(node)) out_ += "<p>";
+            if (node.parent != npos) {
+                const auto& parent = document_.node(node.parent);
+                if (parent.type == NodeType::item && parent.task && parent.first_child == id)
+                    render_checkbox(parent);
+            }
             render_children_inline(node);
             if (!tight_paragraph(node)) out_ += "</p>\n";
+            break;
+        case NodeType::table:
+            render_table(node);
             break;
         case NodeType::document:
             for (auto child = node.first_child; child != npos; child = document_.node(child).next) render_block(child);
@@ -197,6 +258,8 @@ private:
             out_ += "<em>"; render_children_inline(node); out_ += "</em>"; break;
         case NodeType::strong:
             out_ += "<strong>"; render_children_inline(node); out_ += "</strong>"; break;
+        case NodeType::strikethrough:
+            out_ += "<del>"; render_children_inline(node); out_ += "</del>"; break;
         case NodeType::link:
             out_ += "<a href=\"";
             append_escaped(out_, percent_encode_url(node.literal), true);
@@ -244,6 +307,12 @@ void render_ast_node(const Document& document, NodeId id, std::string& out, int 
     if (!node.literal.empty()) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"literal\":"; if (pretty) out += " "; append_json_string(out, node.literal); }
     if (!node.title.empty()) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"title\":"; if (pretty) out += " "; append_json_string(out, node.title); }
     if (node.type == NodeType::heading) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"level\": " + std::to_string(node.number); }
+    if (node.type == NodeType::table) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"columns\": " + std::to_string(node.number); }
+    if (node.type == NodeType::table_cell) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"alignment\": "; append_json_string(out, alignment_name(node.alignment)); }
+    if (node.type == NodeType::item && node.task) {
+        out += ","; if (pretty) out += "\n"; indent(1); out += "\"task\": true,";
+        if (pretty) out += "\n"; indent(1); out += "\"checked\": "; out += node.checked ? "true" : "false";
+    }
     if (node.type == NodeType::list) {
         out += ","; if (pretty) out += "\n"; indent(1);
         out += "\"list_kind\": \"" + std::string(node.list_kind == ListKind::ordered ? "ordered" : "bullet") + "\",";
@@ -265,6 +334,9 @@ void render_ast_node(const Document& document, NodeId id, std::string& out, int 
 
 void append_event_attributes(std::string& out, const Node& node) {
     if (node.type == NodeType::heading) out += " level=" + std::to_string(node.number);
+    if (node.type == NodeType::table) out += " columns=" + std::to_string(node.number);
+    if (node.type == NodeType::table_cell) { out += " alignment="; out += alignment_name(node.alignment); }
+    if (node.type == NodeType::item && node.task) out += node.checked ? " task=checked" : " task=unchecked";
     if (node.type == NodeType::list) {
         out += node.list_kind == ListKind::ordered ? " kind=ordered" : " kind=bullet";
         out += " start=" + std::to_string(node.number);

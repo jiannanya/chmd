@@ -10,7 +10,7 @@ Document::Document() {
     nodes_.back().type = NodeType::document;
 }
 
-const char* version() noexcept { return "1.0.0"; }
+const char* version() noexcept { return "1.1.0"; }
 
 std::string_view node_type_name(NodeType type) noexcept {
     using enum NodeType;
@@ -24,6 +24,11 @@ std::string_view node_type_name(NodeType type) noexcept {
     case code_block: return "code_block";
     case html_block: return "html_block";
     case paragraph: return "paragraph";
+    case table: return "table";
+    case table_head: return "table_head";
+    case table_body: return "table_body";
+    case table_row: return "table_row";
+    case table_cell: return "table_cell";
     case text: return "text";
     case soft_break: return "soft_break";
     case line_break: return "line_break";
@@ -31,6 +36,7 @@ std::string_view node_type_name(NodeType type) noexcept {
     case html_inline: return "html_inline";
     case emphasis: return "emphasis";
     case strong: return "strong";
+    case strikethrough: return "strikethrough";
     case link: return "link";
     case image: return "image";
     }

@@ -4,11 +4,13 @@
 
 `chmd` is a zero-runtime-dependency, C++20, UTF-8-first CommonMark parser. Its core is an entirely independent implementation built around a two-pass parsing strategy and an efficient callback interface.
 
-The current release strictly implements CommonMark 0.31.2 and passes all **652/652** examples in the official `spec.json` fixture. The library provides:
+The current release implements the complete CommonMark 0.31.2 core and passes all **652/652** examples in the official `spec.json` fixture. Extended Markdown syntax is enabled by default and can be disabled as a bundle or feature by feature. The library provides:
 
 - A compact, index-based AST;
 - SAX-style enter, leave, and text callbacks, plus stable line-oriented event output;
 - CommonMark HTML rendering;
+- Pipe tables with column alignment, escaped pipes, inline cell content, and body column normalization;
+- Single- and double-tilde strikethrough, plus nested checked and unchecked task list items;
 - A command-line tool with `html`, `ast`, and `events` output modes;
 - Configurable input-size, node-count, and nesting-depth limits, with optional strict UTF-8 validation;
 - Official conformance tests, unit tests, deterministic mixed-boundary tests, adversarial complexity tests, and a libFuzzer entry point.
@@ -55,6 +57,14 @@ int main() {
 
 For structured streaming, derive from `EventHandler` and call `Parser::parse_events()`. Callbacks are strictly nested: non-text nodes receive `enter` and `leave`, while text, code, line breaks, and raw HTML receive `text`.
 
+Tables, strikethrough, and task lists are enabled in `ParseOptions::extensions` by default. Each feature can be switched independently. To request strict CommonMark parsing through the API:
+
+```cpp
+chmd::ParseOptions options;
+options.extensions = {false, false, false};
+auto result = chmd::Parser(options).parse(markdown);
+```
+
 ## Command line
 
 ```sh
@@ -63,7 +73,11 @@ chmd --to ast document.md
 chmd --to events document.md
 chmd --safe untrusted.md       # Escape raw HTML
 chmd --validate-utf8 input.md  # Reject invalid UTF-8
+chmd --commonmark input.md     # Disable all extended syntax
+chmd --no-tables input.md      # Disable one extension independently
 ```
+
+The other individual switches are `--no-strikethrough` and `--no-task-lists`.
 
 When no file is specified, or when the input is `-`, the command reads from standard input. On Windows, standard input and output use binary mode so HTML and conformance results retain LF line endings instead of being rewritten to CRLF by the CRT.
 
@@ -82,7 +96,7 @@ leave document
 
 ## Implementation and performance
 
-Parsing is divided into block and inline passes. The block scanner maintains a stack of open containers; the inline scanner maintains delimiter stacks for emphasis and links. Backtick runs are pre-indexed, and emphasis matching records lower bounds for opener searches to avoid repeated whole-input rescans. Tabs participate in structural parsing at four-column tab stops, and unconsumed columns crossing structural boundaries are returned to the content as spaces.
+Parsing is divided into block and inline passes. The block scanner maintains a stack of open containers; the inline scanner maintains delimiter stacks for emphasis, strikethrough, and links. Backtick runs are pre-indexed, and emphasis matching records lower bounds for opener searches to avoid repeated whole-input rescans. Tables are recognized from a single header and delimiter row, then body rows are normalized to the declared column count without retaining ignored excess cells. Tabs participate in structural parsing at four-column tab stops, and unconsumed columns crossing structural boundaries are returned to the content as spaces.
 
 The implementation priorities are performance first, memory use second, and binary/source footprint third:
 
@@ -105,7 +119,8 @@ The benchmark repeatedly parses approximately 1 MiB of mixed headings, lists, li
 ## Tests and specification fixture
 
 - `tests/spec.json`: all 652 official CommonMark 0.31.2 examples;
-- `tests/test_main.cpp`: public API, core semantics, and error-limit unit tests;
+- `tests/test_main.cpp`: public API, core semantics, extended syntax, and error-limit unit tests;
+- `tests/test_extensions.cpp`: tables, task lists, strikethrough, feature switches, and structured-output metadata;
 - `tests/test_boundaries.cpp`: tree invariants, 2,500 deterministic mixed-byte cases, depth/node limits, and adversarial input;
 - `tests/fuzz_parser.cpp`: libFuzzer entry point covering parsing and all three output formats;
 - `tools/generate_tables.py`: reproducible HTML5 entity and Unicode classification/folding table generation.

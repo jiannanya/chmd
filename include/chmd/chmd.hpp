@@ -22,6 +22,11 @@ enum class NodeType : std::uint8_t {
     code_block,
     html_block,
     paragraph,
+    table,
+    table_head,
+    table_body,
+    table_row,
+    table_cell,
     text,
     soft_break,
     line_break,
@@ -29,11 +34,13 @@ enum class NodeType : std::uint8_t {
     html_inline,
     emphasis,
     strong,
+    strikethrough,
     link,
     image
 };
 
 enum class ListKind : std::uint8_t { bullet, ordered };
+enum class TableAlignment : std::uint8_t { none, left, center, right };
 
 struct SourceRange {
     std::uint32_t begin = 0;
@@ -56,13 +63,22 @@ struct Node {
     std::string literal;
     std::string title;
 
-    std::uint32_t number = 0;       // heading level or ordered-list start
+    std::uint32_t number = 0;       // heading level, ordered-list start, or table column count
     std::uint16_t marker_offset = 0;
     std::uint16_t padding = 0;
     char marker = 0;
     ListKind list_kind = ListKind::bullet;
+    TableAlignment alignment = TableAlignment::none;
     bool tight = true;
     bool fenced = false;
+    bool task = false;
+    bool checked = false;
+};
+
+struct ExtensionOptions {
+    bool tables = true;
+    bool strikethrough = true;
+    bool task_lists = true;
 };
 
 struct ParseOptions {
@@ -72,6 +88,7 @@ struct ParseOptions {
     std::size_t max_nodes = 0;
     std::size_t max_nesting = 1000;
     bool validate_utf8 = false;
+    ExtensionOptions extensions{};
 };
 
 enum class ErrorCode : std::uint8_t {
@@ -147,4 +164,3 @@ void walk_events(const Document& document, EventHandler& handler);
 [[nodiscard]] const char* version() noexcept;
 
 } // namespace chmd
-

@@ -271,9 +271,10 @@ AutoLink parse_autolink(std::string_view input, std::size_t begin) {
 class InlineParser {
 public:
     InlineParser(Builder& builder, NodeId parent,
-                 std::string input, const ReferenceMap& references)
+                  std::string input, const ReferenceMap& references,
+                  const ParseOptions& options)
         : builder_(builder), parent_(parent), input_(std::move(input)),
-          references_(references) {}
+          references_(references), options_(options) {}
 
     void run() {
         builder_.get(parent_).literal.clear();
@@ -286,6 +287,7 @@ public:
             else if (c == '<') parse_less_than();
             else if (c == '\n') parse_newline();
             else if (c == '*' || c == '_') parse_emphasis_run();
+            else if (c == '~' && options_.extensions.strikethrough) parse_strikethrough_run();
             else if (c == '[') parse_open_bracket(false);
             else if (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '[') parse_open_bracket(true);
             else if (c == ']') parse_close_bracket();
@@ -470,6 +472,25 @@ private:
         }
     }
 
+    void parse_strikethrough_run() {
+        const auto begin = pos_;
+        while (pos_ < input_.size() && input_[pos_] == '~') ++pos_;
+        const auto length = pos_ - begin;
+        const auto id = append_node(NodeType::text, input_.substr(begin, length), begin, pos_, false);
+        if (id == npos || length > 2) return;
+
+        const auto before = decode_utf8_before(input_, begin);
+        const auto after = decode_utf8_at(input_, pos_);
+        const bool before_ws = begin == 0 || is_unicode_whitespace(before);
+        const bool after_ws = pos_ == input_.size() || is_unicode_whitespace(after);
+        const bool before_punct = begin != 0 && is_unicode_punctuation(before);
+        const bool after_punct = pos_ != input_.size() && is_unicode_punctuation(after);
+        const bool can_open = !after_ws && (!after_punct || before_ws || before_punct);
+        const bool can_close = !before_ws && (!before_punct || after_ws || after_punct);
+        builder_.get(id).marker = '~';
+        delimiters_.push_back({'~', id, begin, static_cast<int>(length), can_open, can_close});
+    }
+
     void parse_open_bracket(bool image) {
         const auto begin = pos_;
         const auto length = image ? 2U : 1U;
@@ -575,28 +596,49 @@ private:
         int current = bottom + 1;
         while (current < top) {
             auto& closer = delimiters_[static_cast<std::size_t>(current)];
-            if (closer.removed || (closer.character != '*' && closer.character != '_') || !closer.can_close || closer.length == 0) {
+            if (closer.removed || (closer.character != '*' && closer.character != '_' && closer.character != '~') ||
+                !closer.can_close || closer.length == 0) {
                 ++current;
                 continue;
             }
-            const auto type = static_cast<std::size_t>(closer.character == '*' ? 0 : 1);
-            const auto mod = static_cast<std::size_t>(closer.length % 3);
-            const auto can_open = static_cast<std::size_t>(closer.can_open ? 1 : 0);
             int opener_index = current - 1;
-            for (; opener_index > opener_bottom[type][mod][can_open]; --opener_index) {
-                const auto& candidate = delimiters_[static_cast<std::size_t>(opener_index)];
-                if (!candidate.removed && candidate.character == closer.character && candidate.can_open &&
-                    candidate.length > 0 && !odd_match(candidate, closer)) break;
+            if (closer.character == '~') {
+                for (; opener_index > bottom; --opener_index) {
+                    const auto& candidate = delimiters_[static_cast<std::size_t>(opener_index)];
+                    if (!candidate.removed && candidate.character == '~' && candidate.can_open &&
+                        candidate.length == closer.length) break;
+                }
+                if (opener_index <= bottom) {
+                    if (!closer.can_open) closer.removed = true;
+                    ++current;
+                    continue;
+                }
+            } else {
+                const auto type = static_cast<std::size_t>(closer.character == '*' ? 0 : 1);
+                const auto mod = static_cast<std::size_t>(closer.length % 3);
+                const auto can_open = static_cast<std::size_t>(closer.can_open ? 1 : 0);
+                for (; opener_index > opener_bottom[type][mod][can_open]; --opener_index) {
+                    const auto& candidate = delimiters_[static_cast<std::size_t>(opener_index)];
+                    if (!candidate.removed && candidate.character == closer.character && candidate.can_open &&
+                        candidate.length > 0 && !odd_match(candidate, closer)) break;
+                }
+                if (opener_index <= opener_bottom[type][mod][can_open]) {
+                    opener_bottom[type][mod][can_open] = current - 1;
+                    if (!closer.can_open) closer.removed = true;
+                    ++current;
+                    continue;
+                }
             }
-            if (opener_index <= opener_bottom[type][mod][can_open]) {
-                opener_bottom[type][mod][can_open] = current - 1;
+
+            if (opener_index <= bottom) {
                 if (!closer.can_open) closer.removed = true;
                 ++current;
                 continue;
             }
 
             auto& opener = delimiters_[static_cast<std::size_t>(opener_index)];
-            const int use = opener.length >= 2 && closer.length >= 2 ? 2 : 1;
+            const int use = closer.character == '~' ? closer.length :
+                (opener.length >= 2 && closer.length >= 2 ? 2 : 1);
             auto& opener_text = builder_.get(opener.node).literal;
             auto& closer_text = builder_.get(closer.node).literal;
             opener_text.erase(opener_text.size() - static_cast<std::size_t>(use));
@@ -610,7 +652,9 @@ private:
 
             const auto first = builder_.get(opener.node).next;
             const auto last = builder_.get(closer.node).previous;
-            const auto wrapper = builder_.insert_after(opener.node, use == 2 ? NodeType::strong : NodeType::emphasis);
+            const auto wrapper_type = closer.character == '~' ? NodeType::strikethrough :
+                (use == 2 ? NodeType::strong : NodeType::emphasis);
+            const auto wrapper = builder_.insert_after(opener.node, wrapper_type);
             if (wrapper == npos) return;
             builder_.get(wrapper).source = {builder_.get(opener.node).source.end - static_cast<std::uint32_t>(use),
                                             builder_.get(closer.node).source.begin + static_cast<std::uint32_t>(use)};
@@ -633,7 +677,8 @@ private:
         while (pos_ < input_.size()) {
             const char c = input_[pos_];
             if (c == '\\' || c == '`' || c == '&' || c == '<' || c == '\n' || c == '*' ||
-                c == '_' || c == '[' || c == ']' || (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '[')) break;
+                c == '_' || (c == '~' && options_.extensions.strikethrough) || c == '[' || c == ']' ||
+                (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '[')) break;
             ++pos_;
         }
         append_node(NodeType::text, input_.substr(begin, pos_ - begin), begin, pos_);
@@ -643,6 +688,7 @@ private:
     NodeId parent_;
     std::string input_;
     const ReferenceMap& references_;
+    const ParseOptions& options_;
     std::size_t pos_ = 0;
     std::vector<Delimiter> delimiters_;
     std::unordered_map<std::size_t, std::vector<std::size_t>> backticks_;
@@ -650,13 +696,15 @@ private:
 
 } // namespace
 
-void parse_inlines(Builder& builder, const ReferenceMap& references) {
+void parse_inlines(Builder& builder, const ReferenceMap& references,
+                   const ParseOptions& options) {
     const auto initial_size = builder.nodes().size();
     for (NodeId id = 1; id < initial_size && builder.ok(); ++id) {
         const auto type = builder.get(id).type;
-        if ((type == NodeType::paragraph || type == NodeType::heading) && builder.get(id).parent != npos) {
+        if ((type == NodeType::paragraph || type == NodeType::heading || type == NodeType::table_cell) &&
+            builder.get(id).parent != npos) {
             auto literal = std::move(builder.get(id).literal);
-            InlineParser parser(builder, id, std::move(literal), references);
+            InlineParser parser(builder, id, std::move(literal), references, options);
             parser.run();
         }
     }

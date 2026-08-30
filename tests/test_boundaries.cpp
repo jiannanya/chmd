@@ -65,7 +65,12 @@ int main() {
         "-\t\tfoo\n", ">\t\tfoo\n", "***\n---\n___\n",
         "[x](<a b> \"t\")", "[x]: /u\n\n[x]", "![*a*](u)",
         "<!-- a -->\n\n<a x='>'>z</a>", "`` ` ``", "***a***",
-        "- a\n  - b\n\n    c\n", "1. a\n2) b\n", "a  \nb\\\nc\n"
+        "- a\n  - b\n\n    c\n", "1. a\n2) b\n", "a  \nb\\\nc\n",
+        "| a\\|b | c |\n| :--- | ---: |\n| `x\\|y` | ~~z~~ |\n",
+        "- [\t]\tfoo\n- [X] bar\n", "~~~not~~~ ~~yes~~ ~one~\n",
+        "- | a | b |\n  | - | - |\n  | c | d |\n",
+        "> | a | b |\n> | - | - |\n> | c | d |\n",
+        "| a | b |\n| - | - |\nplain\n# stop\n"
     };
     for (const auto& input : fixed) validate(input);
     validate(std::string("a\0b", 3));

@@ -388,6 +388,95 @@ std::size_t trim_line_end(std::string_view text, std::size_t end) {
     return end;
 }
 
+struct TableCellSlice {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+};
+
+struct TableRowParse {
+    std::vector<TableCellSlice> cells;
+    bool has_pipe = false;
+};
+
+bool escaped_pipe(std::string_view row, std::size_t offset) noexcept {
+    std::size_t slashes = 0;
+    while (offset > slashes && row[offset - slashes - 1] == '\\') ++slashes;
+    return (slashes & 1U) != 0;
+}
+
+TableRowParse split_table_row(std::string_view row,
+                              std::size_t max_cells = std::numeric_limits<std::size_t>::max()) {
+    TableRowParse result;
+    std::size_t begin = 0;
+    std::size_t end = trim_line_end(row, row.size());
+    while (begin < end && ascii_space(row[begin])) ++begin;
+    if (begin == end) return result;
+
+    std::size_t cell_begin = begin;
+    if (row[begin] == '|') {
+        result.has_pipe = true;
+        cell_begin = begin + 1;
+    }
+    for (std::size_t i = cell_begin; i < end; ++i) {
+        if (row[i] != '|' || escaped_pipe(row, i)) continue;
+        result.has_pipe = true;
+        auto first = cell_begin;
+        auto last = i;
+        while (first < last && ascii_space(row[first])) ++first;
+        while (last > first && ascii_space(row[last - 1])) --last;
+        if (result.cells.size() < max_cells) result.cells.push_back({first, last});
+        cell_begin = i + 1;
+    }
+    if (cell_begin < end || row[end - 1] != '|') {
+        auto first = cell_begin;
+        auto last = end;
+        while (first < last && ascii_space(row[first])) ++first;
+        while (last > first && ascii_space(row[last - 1])) --last;
+        if (result.cells.size() < max_cells) result.cells.push_back({first, last});
+    }
+    return result;
+}
+
+std::string table_cell_text(std::string_view row, TableCellSlice cell) {
+    std::string result;
+    result.reserve(cell.end - cell.begin);
+    for (auto i = cell.begin; i < cell.end; ++i) {
+        if (row[i] == '\\' && i + 1 < cell.end && row[i + 1] == '|') continue;
+        result.push_back(row[i]);
+    }
+    return result;
+}
+
+bool parse_table_delimiter(std::string_view row,
+                           std::vector<TableAlignment>& alignments) {
+    const auto parsed = split_table_row(row);
+    if (!parsed.has_pipe || parsed.cells.empty()) return false;
+    alignments.clear();
+    alignments.reserve(parsed.cells.size());
+    for (const auto cell : parsed.cells) {
+        auto value = row.substr(cell.begin, cell.end - cell.begin);
+        bool left = false;
+        bool right = false;
+        if (!value.empty() && value.front() == ':') {
+            left = true;
+            value.remove_prefix(1);
+        }
+        if (!value.empty() && value.back() == ':') {
+            right = true;
+            value.remove_suffix(1);
+        }
+        if (value.empty() || !std::all_of(value.begin(), value.end(),
+            [](char c) { return c == '-'; })) return false;
+        alignments.push_back(left && right ? TableAlignment::center :
+            (left ? TableAlignment::left : (right ? TableAlignment::right : TableAlignment::none)));
+    }
+    return true;
+}
+
+bool task_whitespace(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
 struct ReferenceParse {
     std::size_t consumed = 0;
     std::string label;
@@ -533,6 +622,7 @@ public:
         close_to(1);
         finalize_lists();
         extract_references();
+        if (options_.extensions.task_lists) finalize_task_items();
         return std::move(references_);
     }
 
@@ -639,7 +729,8 @@ private:
                 }
                 break;
             }
-            if (node.type == NodeType::html_block || node.type == NodeType::paragraph) {
+            if (node.type == NodeType::html_block || node.type == NodeType::paragraph ||
+                node.type == NodeType::table) {
                 matched = index + 1;
                 break;
             }
@@ -744,6 +835,19 @@ private:
                 touch_open(info.next);
                 if (html_block_ends(static_cast<int>(tip.number), tip.literal, line)) close_to(open_.size() - 1);
                 return;
+            } else if (tip.type == NodeType::table) {
+                const auto ind = indentation(line, pos, column);
+                const auto content = line.substr(ind.first);
+                const bool reference_definition = !content.empty() && content.front() == '[' &&
+                    parse_reference(content).consumed != 0;
+                if (!ind.blank && ind.columns <= 3 && !inline_interrupt(line, pos, column) &&
+                    !reference_definition) {
+                    const auto table = open_.back();
+                    append_table_body_row(table, content, info.begin + ind.first, info.next);
+                    touch_open(info.next);
+                    return;
+                }
+                close_to(open_.size() - 1);
             }
         }
 
@@ -761,6 +865,11 @@ private:
                 return;
             }
             std::uint32_t level = 0;
+            if (options_.extensions.tables &&
+                try_open_table(open_.back(), line.substr(ind.first), info.begin + ind.first, info.next)) {
+                touch_open(info.next);
+                return;
+            }
             if (setext_underline(line, pos, column, level)) {
                 while (!p.literal.empty() && (p.literal.back() == ' ' || p.literal.back() == '\t')) p.literal.pop_back();
                 p.type = NodeType::heading;
@@ -930,6 +1039,102 @@ private:
         touch_open(info.next);
     }
 
+    NodeId append_table_cell(NodeId row, std::string_view raw,
+                             std::optional<TableCellSlice> slice,
+                             std::size_t source_base, TableAlignment alignment) {
+        const auto local_begin = slice ? slice->begin : raw.size();
+        const auto local_end = slice ? slice->end : raw.size();
+        const auto cell = builder_.append(row, NodeType::table_cell,
+            {static_cast<std::uint32_t>(source_base + local_begin),
+             static_cast<std::uint32_t>(source_base + local_end)});
+        if (cell != npos) {
+            builder_.get(cell).alignment = alignment;
+            if (slice) builder_.get(cell).literal = table_cell_text(raw, *slice);
+        }
+        return cell;
+    }
+
+    bool try_open_table(NodeId paragraph, std::string_view delimiter,
+                        std::size_t delimiter_begin, std::size_t delimiter_end) {
+        std::vector<TableAlignment> alignments;
+        if (!parse_table_delimiter(delimiter, alignments)) return false;
+
+        const auto full_text = builder_.get(paragraph).literal;
+        const auto last_newline = full_text.rfind('\n');
+        const auto header_offset = last_newline == std::string::npos ? 0 : last_newline + 1;
+        const std::string_view header_text(full_text.data() + header_offset, full_text.size() - header_offset);
+        const auto header = split_table_row(header_text);
+        if (!header.has_pipe || header.cells.size() != alignments.size()) return false;
+
+        auto header_source = builder_.get(paragraph).source;
+        NodeId table = paragraph;
+        if (last_newline != std::string::npos) {
+            const auto current_line_break = delimiter_begin == 0 ? std::string::npos :
+                source_.rfind('\n', delimiter_begin - 1);
+            const auto header_line_end = current_line_break == std::string::npos ? delimiter_begin : current_line_break + 1;
+            const auto prior_break = header_line_end <= 1 ? std::string::npos :
+                source_.rfind('\n', header_line_end - 2);
+            const auto physical_begin = prior_break == std::string::npos ? 0 : prior_break + 1;
+            const auto physical_end = current_line_break == std::string::npos ? delimiter_begin : current_line_break;
+            const auto physical_line = std::string_view(source_).substr(physical_begin, physical_end - physical_begin);
+            const auto found = physical_line.rfind(header_text);
+            header_source.begin = static_cast<std::uint32_t>(physical_begin +
+                (found == std::string_view::npos ? 0 : found));
+            header_source.end = static_cast<std::uint32_t>(header_line_end);
+
+            builder_.get(paragraph).literal.resize(last_newline);
+            builder_.get(paragraph).source.end = header_source.begin;
+            table = builder_.insert_after(paragraph, NodeType::table);
+            if (table == npos) return true;
+            builder_.get(table).source = header_source;
+            open_.back() = table;
+        }
+        auto& table_node = builder_.get(table);
+        table_node.type = NodeType::table;
+        table_node.literal.clear();
+        table_node.number = static_cast<std::uint32_t>(alignments.size());
+        table_node.source.end = static_cast<std::uint32_t>(delimiter_end);
+
+        const auto head = builder_.append(table, NodeType::table_head, header_source);
+        if (head == npos) return true;
+        const auto header_row = builder_.append(head, NodeType::table_row, header_source);
+        if (header_row == npos) return true;
+        for (std::size_t column = 0; column < alignments.size(); ++column) {
+            if (append_table_cell(header_row, header_text, header.cells[column],
+                                  header_source.begin, alignments[column]) == npos) return true;
+        }
+        builder_.append(table, NodeType::table_body,
+            {static_cast<std::uint32_t>(delimiter_begin), static_cast<std::uint32_t>(delimiter_end)});
+        return true;
+    }
+
+    void append_table_body_row(NodeId table, std::string_view raw,
+                               std::size_t source_begin, std::size_t source_end) {
+        const auto head = builder_.get(table).first_child;
+        if (head == npos) return;
+        const auto body = builder_.get(head).next;
+        const auto header_row = builder_.get(head).first_child;
+        if (body == npos || header_row == npos) return;
+
+        const auto columns = static_cast<std::size_t>(builder_.get(table).number);
+        const auto parsed = split_table_row(raw, columns);
+        const bool first_body_row = builder_.get(body).first_child == npos;
+        const auto row = builder_.append(body, NodeType::table_row,
+            {static_cast<std::uint32_t>(source_begin), static_cast<std::uint32_t>(source_end)});
+        if (row == npos) return;
+        auto header_cell = builder_.get(header_row).first_child;
+        for (std::size_t column = 0; column < columns; ++column) {
+            const auto alignment = header_cell == npos ? TableAlignment::none : builder_.get(header_cell).alignment;
+            const auto slice = column < parsed.cells.size()
+                ? std::optional<TableCellSlice>(parsed.cells[column]) : std::nullopt;
+            if (append_table_cell(row, raw, slice, source_begin, alignment) == npos) return;
+            if (header_cell != npos) header_cell = builder_.get(header_cell).next;
+        }
+        if (first_body_row) builder_.get(body).source.begin = static_cast<std::uint32_t>(source_begin);
+        builder_.get(body).source.end = static_cast<std::uint32_t>(source_end);
+        builder_.get(table).source.end = static_cast<std::uint32_t>(source_end);
+    }
+
     bool push_open(NodeId id, std::size_t offset) {
         if (options_.max_nesting != 0 && open_.size() >= options_.max_nesting) {
             error_ = {ErrorCode::nesting_limit, offset, "nesting limit exceeded"};
@@ -1009,6 +1214,33 @@ private:
                 while (!node.literal.empty() && node.literal.front() == '\n') node.literal.erase(node.literal.begin());
                 if (was_heading) node.title.clear();
             }
+        }
+    }
+
+    void finalize_task_items() {
+        for (NodeId id = 1; id < builder_.nodes().size(); ++id) {
+            if (builder_.get(id).type != NodeType::item) continue;
+            const auto paragraph = builder_.get(id).first_child;
+            if (paragraph == npos || builder_.get(paragraph).type != NodeType::paragraph) continue;
+
+            auto& literal = builder_.get(paragraph).literal;
+            std::size_t marker = 0;
+            while (marker < literal.size() && literal[marker] == ' ') ++marker;
+            if (marker + 2 >= literal.size() || literal[marker] != '[' || literal[marker + 2] != ']') continue;
+            const char state = literal[marker + 1];
+            if (state != 'x' && state != 'X' && !task_whitespace(state)) continue;
+            auto consumed = marker + 3;
+            if (consumed < literal.size()) {
+                if (!task_whitespace(literal[consumed])) continue;
+                ++consumed;
+            }
+
+            builder_.get(id).task = true;
+            builder_.get(id).checked = state == 'x' || state == 'X';
+            literal.erase(0, consumed);
+            auto& source = builder_.get(paragraph).source;
+            source.begin = static_cast<std::uint32_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(source.begin) + consumed, source.end));
         }
     }
 
@@ -1097,7 +1329,7 @@ ParseResult Parser::parse(std::string_view markdown) const {
         detail::Builder builder(result.document, options_, result.error);
         detail::BlockParser parser(result.document, builder, options_, result.error);
         auto references = parser.run();
-        if (!result.error) detail::parse_inlines(builder, references);
+        if (!result.error) detail::parse_inlines(builder, references, options_);
     } catch (const std::bad_alloc&) {
         result.error = {ErrorCode::out_of_memory, 0, "memory allocation failed"};
     }

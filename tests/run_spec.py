@@ -10,6 +10,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--program", required=True)
+    parser.add_argument("--program-arg", action="append", default=[])
     parser.add_argument("--spec", required=True)
     parser.add_argument("--example", type=int)
     parser.add_argument("--compact", action="store_true")
@@ -23,7 +24,7 @@ def main():
     failures = []
     for item in examples:
         process = subprocess.run(
-            [args.program, "--to", "html"],
+            [args.program, *args.program_arg, "--to", "html"],
             input=item["markdown"].encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

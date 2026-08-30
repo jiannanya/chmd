@@ -14,7 +14,8 @@
 namespace {
 
 void usage(std::ostream& out) {
-    out << "usage: chmd [--to html|ast|events] [--safe] [--validate-utf8] [FILE]\n";
+    out << "usage: chmd [--to html|ast|events] [--safe] [--validate-utf8]\n"
+           "            [--commonmark | --no-tables --no-strikethrough --no-task-lists] [FILE]\n";
 }
 
 } // namespace
@@ -33,6 +34,10 @@ int main(int argc, char** argv) {
         if (arg == "--to" && i + 1 < argc) format = argv[++i];
         else if (arg == "--safe") html_options.escape_raw_html = true;
         else if (arg == "--validate-utf8") parse_options.validate_utf8 = true;
+        else if (arg == "--commonmark") parse_options.extensions = {false, false, false};
+        else if (arg == "--no-tables") parse_options.extensions.tables = false;
+        else if (arg == "--no-strikethrough") parse_options.extensions.strikethrough = false;
+        else if (arg == "--no-task-lists") parse_options.extensions.task_lists = false;
         else if (arg == "--version") { std::cout << "chmd " << chmd::version() << '\n'; return 0; }
         else if (arg == "--help" || arg == "-h") { usage(std::cout); return 0; }
         else if (!arg.empty() && arg.front() == '-') { usage(std::cerr); return 2; }

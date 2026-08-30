@@ -4,11 +4,13 @@
 
 `chmd` 是一个零运行时依赖、C++20、UTF-8 优先的 CommonMark 解析库。核心为完全独立的自研实现，采用两遍解析策略并提供高效的回调接口。
 
-当前版本严格实现 CommonMark 0.31.2，并通过官方 `spec.json` 的全部 **652/652** 个示例。库同时提供：
+当前版本完整实现 CommonMark 0.31.2 核心，并通过官方 `spec.json` 的全部 **652/652** 个示例。扩展 Markdown 语法默认开启，既可整体关闭，也可逐项控制。库同时提供：
 
 - 索引化紧凑 AST；
 - SAX 风格的进入、离开、文本回调，以及稳定的行式事件输出；
 - CommonMark HTML 渲染；
+- 支持列对齐、转义竖线、单元格行内语法及正文列数规范化的管道表格；
+- 单波浪线与双波浪线删除线，以及可任意嵌套的选中/未选中任务列表；
 - 命令行工具，支持 `html`、`ast`、`events` 三种输出；
 - 输入字节数、节点数、嵌套深度限制和可选严格 UTF-8 校验；
 - 官方规范测试、单元测试、确定性混合边界测试、对抗性退化测试和 libFuzzer 入口。
@@ -55,6 +57,14 @@ int main() {
 
 需要结构化流时，可继承 `EventHandler` 并调用 `Parser::parse_events()`。回调顺序严格嵌套：非文本节点收到 `enter` / `leave`，文本、代码、换行和原始 HTML 收到 `text`。
 
+表格、删除线和任务列表在 `ParseOptions::extensions` 中默认开启，并可逐项关闭。通过 API 请求严格 CommonMark 解析：
+
+```cpp
+chmd::ParseOptions options;
+options.extensions = {false, false, false};
+auto result = chmd::Parser(options).parse(markdown);
+```
+
 ## 命令行
 
 ```sh
@@ -63,7 +73,11 @@ chmd --to ast document.md
 chmd --to events document.md
 chmd --safe untrusted.md       # 转义原始 HTML
 chmd --validate-utf8 input.md  # 拒绝非法 UTF-8
+chmd --commonmark input.md     # 关闭全部扩展语法
+chmd --no-tables input.md      # 单独关闭表格
 ```
+
+另外两个独立开关为 `--no-strikethrough` 和 `--no-task-lists`。
 
 不指定文件或使用 `-` 时从标准输入读取。Windows 下标准输入输出以二进制模式打开，因此 HTML 与规范测试始终使用 LF，不被 CRT 改写成 CRLF。
 
@@ -82,7 +96,7 @@ leave document
 
 ## 实现与性能取向
 
-解析分为块级和行内两层：块级扫描维护开放容器栈，行内扫描维护强调/链接定界符栈。反引号运行预索引，强调匹配记录 opener 下界，避免常见的重复全串回扫。制表符按 4 列 tab stop 参与结构判断；跨越结构边界时未消费的列会回流为内容空格。
+解析分为块级和行内两层：块级扫描维护开放容器栈，行内扫描维护强调、删除线与链接定界符栈。反引号运行预索引，强调匹配记录 opener 下界，避免常见的重复全串回扫。表格由单行表头与分隔行识别，正文行按声明列数规范化，超出列不会被保留。制表符按 4 列 tab stop 参与结构判断；跨越结构边界时未消费的列会回流为内容空格。
 
 优先级按“性能、内存、产物空间”排序：
 
@@ -105,7 +119,8 @@ cmake --build build-bench --parallel
 ## 测试与规范来源
 
 - `tests/spec.json`：CommonMark 0.31.2 官方 652 个示例；
-- `tests/test_main.cpp`：公共 API、主要语义和错误限制单元测试；
+- `tests/test_main.cpp`：公共 API、主要语义、扩展语法和错误限制单元测试；
+- `tests/test_extensions.cpp`：表格、任务列表、删除线、功能开关和结构化输出元数据测试；
 - `tests/test_boundaries.cpp`：树关系不变量、2500 组确定性随机混合字节、深度/节点限制和对抗性输入；
 - `tests/fuzz_parser.cpp`：解析及三种输出的 libFuzzer 入口；
 - `tools/generate_tables.py`：可重复生成 HTML5 实体和 Unicode 分类/折叠表。

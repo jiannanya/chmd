@@ -64,7 +64,8 @@ std::uint32_t decode_utf8_before(std::string_view text, std::size_t offset) noex
 std::uint32_t decode_utf8_at(std::string_view text, std::size_t offset, std::size_t* width = nullptr) noexcept;
 void append_utf8(std::string& out, std::uint32_t cp);
 
-void parse_inlines(Builder& builder, const ReferenceMap& references);
+void parse_inlines(Builder& builder, const ReferenceMap& references,
+                   const ParseOptions& options);
 
 bool is_leaf(NodeType type) noexcept;
 bool is_textual(NodeType type) noexcept;
