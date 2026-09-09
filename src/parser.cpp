@@ -1,7 +1,6 @@
 #include "internal.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <limits>
 #include <new>
 
@@ -249,8 +248,11 @@ int html_block_start(std::string_view line, std::size_t pos, std::size_t column,
     const auto ind = indentation(line, pos, column);
     if (ind.columns > 3 || ind.blank || line[ind.first] != '<') return 0;
     const auto rest = line.substr(ind.first);
-    if (iequal_prefix(rest, "<script") || iequal_prefix(rest, "<pre") ||
-        iequal_prefix(rest, "<style") || iequal_prefix(rest, "<textarea")) return 1;
+    for (const auto tag : {std::string_view("<script"), std::string_view("<pre"),
+                           std::string_view("<style"), std::string_view("<textarea")}) {
+        if (iequal_prefix(rest, tag) && (rest.size() == tag.size() ||
+            ascii_space(rest[tag.size()]) || rest[tag.size()] == '>')) return 1;
+    }
     if (rest.starts_with("<!--")) return 2;
     if (rest.starts_with("<?")) return 3;
     if (rest.starts_with("<![CDATA[")) return 5;
@@ -284,9 +286,9 @@ int html_block_start(std::string_view line, std::size_t pos, std::size_t column,
     i = 1;
     bool closing = false;
     if (i < rest.size() && rest[i] == '/') { closing = true; ++i; }
-    if (i == rest.size() || !std::isalpha(static_cast<unsigned char>(rest[i]))) return 0;
+    if (i == rest.size() || !ascii_alpha(static_cast<unsigned char>(rest[i]))) return 0;
     ++i;
-    while (i < rest.size() && (std::isalnum(static_cast<unsigned char>(rest[i])) || rest[i] == '-')) ++i;
+    while (i < rest.size() && (ascii_alnum(static_cast<unsigned char>(rest[i])) || rest[i] == '-')) ++i;
     if (closing) {
         while (i < rest.size() && ascii_space(rest[i])) ++i;
         if (i >= rest.size() || rest[i] != '>') return 0;
@@ -308,10 +310,10 @@ int html_block_start(std::string_view line, std::size_t pos, std::size_t column,
             return i == rest.size() ? 7 : 0;
         }
         if (!separated) return 0;
-        if (i == rest.size() || !(std::isalpha(static_cast<unsigned char>(rest[i])) ||
+        if (i == rest.size() || !(ascii_alpha(static_cast<unsigned char>(rest[i])) ||
             rest[i] == '_' || rest[i] == ':')) return 0;
         ++i;
-        while (i < rest.size() && (std::isalnum(static_cast<unsigned char>(rest[i])) ||
+        while (i < rest.size() && (ascii_alnum(static_cast<unsigned char>(rest[i])) ||
                rest[i] == '_' || rest[i] == '.' || rest[i] == ':' || rest[i] == '-')) ++i;
         while (i < rest.size() && ascii_space(rest[i])) ++i;
         if (i < rest.size() && rest[i] == '=') {
@@ -334,20 +336,20 @@ int html_block_start(std::string_view line, std::size_t pos, std::size_t column,
     return 0;
 }
 
-bool html_block_ends(int type, std::string_view accumulated, std::string_view line) {
+bool html_block_ends(int type, std::string_view line) {
     switch (type) {
     case 1: {
-        std::string lower(line);
-        std::transform(lower.begin(), lower.end(), lower.begin(), lower_ascii);
-        return lower.find("</script>") != std::string::npos ||
-               lower.find("</pre>") != std::string::npos ||
-               lower.find("</style>") != std::string::npos ||
-               lower.find("</textarea>") != std::string::npos;
+        for (auto pos = line.find('<'); pos != std::string_view::npos; pos = line.find('<', pos + 1)) {
+            const auto rest = line.substr(pos);
+            if (iequal_prefix(rest, "</script>") || iequal_prefix(rest, "</pre>") ||
+                iequal_prefix(rest, "</style>") || iequal_prefix(rest, "</textarea>")) return true;
+        }
+        return false;
     }
-    case 2: return accumulated.find("-->") != std::string_view::npos;
-    case 3: return accumulated.find("?>") != std::string_view::npos;
-    case 4: return accumulated.find('>') != std::string_view::npos;
-    case 5: return accumulated.find("]]>") != std::string_view::npos;
+    case 2: return line.find("-->") != std::string_view::npos;
+    case 3: return line.find("?>") != std::string_view::npos;
+    case 4: return line.find('>') != std::string_view::npos;
+    case 5: return line.find("]]>") != std::string_view::npos;
     default: return false;
     }
 }
@@ -404,9 +406,10 @@ bool escaped_pipe(std::string_view row, std::size_t offset) noexcept {
     return (slashes & 1U) != 0;
 }
 
-TableRowParse split_table_row(std::string_view row,
+const TableRowParse& split_table_row(std::string_view row, TableRowParse& result,
                               std::size_t max_cells = std::numeric_limits<std::size_t>::max()) {
-    TableRowParse result;
+    result.cells.clear();
+    result.has_pipe = false;
     std::size_t begin = 0;
     std::size_t end = trim_line_end(row, row.size());
     while (begin < end && ascii_space(row[begin])) ++begin;
@@ -448,8 +451,8 @@ std::string table_cell_text(std::string_view row, TableCellSlice cell) {
 }
 
 bool parse_table_delimiter(std::string_view row,
-                           std::vector<TableAlignment>& alignments) {
-    const auto parsed = split_table_row(row);
+                           std::vector<TableAlignment>& alignments, TableRowParse& scratch) {
+    const auto& parsed = split_table_row(row, scratch);
     if (!parsed.has_pipe || parsed.cells.empty()) return false;
     alignments.clear();
     alignments.reserve(parsed.cells.size());
@@ -536,6 +539,7 @@ ReferenceParse parse_reference(std::string_view text) {
         const auto begin = i;
         bool escaped = false;
         while (i < text.size() && text[i] != '\n' && (text[i] != '>' || escaped)) {
+            if (!escaped && text[i] == '<') return {};
             escaped = text[i] == '\\' && !escaped;
             if (text[i] != '\\') escaped = false;
             ++i;
@@ -549,6 +553,7 @@ ReferenceParse parse_reference(std::string_view text) {
         bool escaped = false;
         while (i < text.size() && text[i] != '\n' && !ascii_space(text[i])) {
             const char c = text[i];
+            if (static_cast<unsigned char>(c) < 0x20U || c == '\x7F') return {};
             if (!escaped && c == '(' && ++depth > 32) return {};
             if (!escaped && c == ')' && --depth < 0) break;
             escaped = !escaped && c == '\\';
@@ -575,6 +580,7 @@ ReferenceParse parse_reference(std::string_view text) {
         const auto begin = i;
         bool escaped = false;
         while (i < text.size() && (text[i] != closer || escaped)) {
+            if (!escaped && opener == '(' && text[i] == '(') break;
             if (text[i] == '\n' && i + 1 < text.size() && text[i + 1] == '\n') break;
             escaped = !escaped && text[i] == '\\';
             if (text[i] != '\\') escaped = false;
@@ -614,10 +620,12 @@ public:
     }
 
     ReferenceMap run() {
-        build_lines();
-        for (const auto& line_info : lines_) {
-            if (!builder_.ok()) break;
-            process_line(line_info);
+        for (std::size_t begin = 0; begin < source_.size() && builder_.ok();) {
+            const auto newline = source_.find('\n', begin);
+            const auto end = newline == std::string::npos ? source_.size() : newline;
+            const auto next = newline == std::string::npos ? end : end + 1;
+            process_line({begin, end, next});
+            begin = next;
         }
         close_to(1);
         finalize_lists();
@@ -627,19 +635,6 @@ public:
     }
 
 private:
-    void build_lines() {
-        std::size_t begin = 0;
-        while (begin < source_.size()) {
-            const auto end = source_.find('\n', begin);
-            if (end == std::string::npos) {
-                lines_.push_back({begin, source_.size(), source_.size()});
-                return;
-            }
-            lines_.push_back({begin, end, end + 1});
-            begin = end + 1;
-        }
-    }
-
     void touch_open(std::size_t end) {
         const auto bounded = static_cast<std::uint32_t>(std::min<std::size_t>(end, std::numeric_limits<std::uint32_t>::max()));
         for (const auto id : open_) builder_.get(id).source.end = bounded;
@@ -833,7 +828,7 @@ private:
                 }
                 append_line(tip, line, pos);
                 touch_open(info.next);
-                if (html_block_ends(static_cast<int>(tip.number), tip.literal, line)) close_to(open_.size() - 1);
+                if (html_block_ends(static_cast<int>(tip.number), line)) close_to(open_.size() - 1);
                 return;
             } else if (tip.type == NodeType::table) {
                 const auto ind = indentation(line, pos, column);
@@ -1007,7 +1002,7 @@ private:
             auto& node = builder_.get(id);
             node.number = static_cast<std::uint32_t>(html_type);
             append_line(node, line, pos);
-            if (!html_block_ends(html_type, node.literal, line)) push_open(id, info.begin + ind.first);
+            if (!html_block_ends(html_type, line)) push_open(id, info.begin + ind.first);
             touch_open(info.next);
             return;
         }
@@ -1056,15 +1051,20 @@ private:
 
     bool try_open_table(NodeId paragraph, std::string_view delimiter,
                         std::size_t delimiter_begin, std::size_t delimiter_end) {
-        std::vector<TableAlignment> alignments;
-        if (!parse_table_delimiter(delimiter, alignments)) return false;
+        auto& alignments = alignments_;
+        if (!parse_table_delimiter(delimiter, alignments, row_scratch_)) return false;
 
-        const auto full_text = builder_.get(paragraph).literal;
+        const std::string_view full_text(builder_.get(paragraph).literal);
         const auto last_newline = full_text.rfind('\n');
         const auto header_offset = last_newline == std::string::npos ? 0 : last_newline + 1;
-        const std::string_view header_text(full_text.data() + header_offset, full_text.size() - header_offset);
-        const auto header = split_table_row(header_text);
+        auto header_text = full_text.substr(header_offset);
+        const auto& header = split_table_row(header_text, row_scratch_);
         if (!header.has_pipe || header.cells.size() != alignments.size()) return false;
+
+        // A failed candidate must not copy the growing paragraph. Once a table
+        // is confirmed, retain only its header while the arena is modified.
+        const std::string saved_header(header_text);
+        header_text = saved_header;
 
         auto header_source = builder_.get(paragraph).source;
         NodeId table = paragraph;
@@ -1091,7 +1091,7 @@ private:
         }
         auto& table_node = builder_.get(table);
         table_node.type = NodeType::table;
-        table_node.literal.clear();
+        std::string{}.swap(table_node.literal);
         table_node.number = static_cast<std::uint32_t>(alignments.size());
         table_node.source.end = static_cast<std::uint32_t>(delimiter_end);
 
@@ -1117,7 +1117,7 @@ private:
         if (body == npos || header_row == npos) return;
 
         const auto columns = static_cast<std::size_t>(builder_.get(table).number);
-        const auto parsed = split_table_row(raw, columns);
+        const auto& parsed = split_table_row(raw, row_scratch_, columns);
         const bool first_body_row = builder_.get(body).first_child == npos;
         const auto row = builder_.append(body, NodeType::table_row,
             {static_cast<std::uint32_t>(source_begin), static_cast<std::uint32_t>(source_end)});
@@ -1248,11 +1248,12 @@ private:
     Builder& builder_;
     const ParseOptions& options_;
     ParseError& error_;
-    std::vector<Line> lines_;
     std::vector<NodeId> open_;
     bool blank_pending_ = false;
     NodeId blank_barrier_ = npos;
     ReferenceMap references_;
+    TableRowParse row_scratch_;
+    std::vector<TableAlignment> alignments_;
 };
 
 } // namespace
@@ -1286,16 +1287,19 @@ bool valid_utf8(std::string_view input, std::size_t& bad_offset) noexcept {
 void normalize_input(std::string_view input, std::string& output) {
     output.clear();
     output.reserve(input.size());
-    for (std::size_t i = 0; i < input.size(); ++i) {
+    for (std::size_t i = 0; i < input.size();) {
+        const auto special = input.find_first_of(std::string_view("\r\0", 2), i);
+        if (special == std::string_view::npos) { output.append(input.substr(i)); break; }
+        output.append(input.substr(i, special - i));
+        i = special;
         const char c = input[i];
         if (c == '\r') {
             if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
             output.push_back('\n');
         } else if (c == '\0') {
             output.append("\xEF\xBF\xBD");
-        } else {
-            output.push_back(c);
         }
+        ++i;
     }
 }
 
@@ -1320,16 +1324,30 @@ ParseResult Parser::parse(std::string_view markdown) const {
         }
         detail::normalize_input(markdown, detail_access::source(result.document));
         const auto& normalized = detail_access::source(result.document);
-        const auto line_count = static_cast<std::size_t>(std::count(normalized.begin(), normalized.end(), '\n')) + 1;
-        auto reserve_nodes = line_count > (std::numeric_limits<std::size_t>::max() - 8) / 2
-            ? std::numeric_limits<std::size_t>::max() : line_count * 2 + 8;
-        if (options_.max_nodes != 0) reserve_nodes = std::min(reserve_nodes, options_.max_nodes);
-        reserve_nodes = std::min(reserve_nodes, static_cast<std::size_t>(npos - 1));
-        detail_access::nodes(result.document).reserve(reserve_nodes);
+        if (normalized.size() > std::numeric_limits<std::uint32_t>::max()) {
+            result.error = {ErrorCode::input_too_large, 0, "normalized input exceeds addressable size"};
+            return result;
+        }
         detail::Builder builder(result.document, options_, result.error);
-        detail::BlockParser parser(result.document, builder, options_, result.error);
-        auto references = parser.run();
-        if (!result.error) detail::parse_inlines(builder, references, options_);
+        auto references = detail::BlockParser(result.document, builder, options_, result.error).run();
+        if (!result.error) {
+            builder.compact(1, 0);
+            detail::parse_inlines(builder, references, options_);
+        }
+        if (!result.error && options_.max_nesting != 0) {
+            detail::walk(result.document, [&](NodeId id, std::size_t depth) {
+                if (depth >= options_.max_nesting && !result.error)
+                    result.error = {ErrorCode::nesting_limit, result.document.node(id).source.begin,
+                                    "nesting limit exceeded"};
+                return !result.error;
+            }, [](NodeId, std::size_t) {});
+        }
+        auto& nodes = detail_access::nodes(result.document);
+        // Retire a large construction arena when only a small result remains
+        // (e.g. reference definitions or unmatched punctuation). Normal trees
+        // keep their spare capacity and avoid an extra move/allocation.
+        if (!result.error && nodes.capacity() > 64 && nodes.size() < nodes.capacity() / 4)
+            nodes.shrink_to_fit();
     } catch (const std::bad_alloc&) {
         result.error = {ErrorCode::out_of_memory, 0, "memory allocation failed"};
     }

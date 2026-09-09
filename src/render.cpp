@@ -1,13 +1,16 @@
 #include "internal.hpp"
 
-#include <iomanip>
-#include <sstream>
+#include <algorithm>
 
 namespace chmd {
 namespace {
 
 void append_escaped(std::string& out, std::string_view text, bool attribute = false) {
-    for (const char c : text) {
+    for (std::size_t begin = 0; begin < text.size();) {
+        const auto special = text.find_first_of("&<>\"", begin);
+        if (special == std::string_view::npos) { out.append(text.substr(begin)); break; }
+        out.append(text.substr(begin, special - begin));
+        const char c = text[special];
         switch (c) {
         case '&': out += "&amp;"; break;
         case '<': out += "&lt;"; break;
@@ -15,6 +18,7 @@ void append_escaped(std::string& out, std::string_view text, bool attribute = fa
         case '"': out += "&quot;"; break;
         default: out.push_back(c); break;
         }
+        begin = special + 1;
     }
     (void)attribute;
 }
@@ -22,8 +26,19 @@ void append_escaped(std::string& out, std::string_view text, bool attribute = fa
 void append_json_string(std::string& out, std::string_view text) {
     out.push_back('"');
     static constexpr char hex[] = "0123456789abcdef";
-    for (const char raw : text) {
-        const auto c = static_cast<unsigned char>(raw);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const auto c = static_cast<unsigned char>(text[i]);
+        if (c >= 0x80U) {
+            const std::size_t width = c >= 0xC2U && c <= 0xDFU ? 2 :
+                (c >= 0xE0U && c <= 0xEFU ? 3 : (c >= 0xF0U && c <= 0xF4U ? 4 : 1));
+            const auto sequence = text.substr(i, width);
+            std::size_t bad = 0;
+            if (sequence.size() == width && detail::valid_utf8(sequence, bad)) {
+                out.append(sequence);
+                i += width - 1;
+            } else out += "\\ufffd";
+            continue;
+        }
         switch (c) {
         case '"': out += "\\\""; break;
         case '\\': out += "\\\\"; break;
@@ -45,24 +60,22 @@ void append_json_string(std::string& out, std::string_view text) {
     out.push_back('"');
 }
 
-std::string percent_encode_url(std::string_view url) {
+void append_url(std::string& out, std::string_view url) {
     static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(url.size());
     for (const char raw : url) {
         const auto c = static_cast<unsigned char>(raw);
-        const bool safe = std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' ||
+        const bool safe = detail::ascii_alnum(c) || c == '-' || c == '.' || c == '_' || c == '~' ||
             c == ':' || c == '/' || c == '?' || c == '#' || c == '@' ||
             c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
             c == '+' || c == ',' || c == ';' || c == '=' || c == '%';
-        if (safe && c < 0x80U) out.push_back(static_cast<char>(c));
+        if (c == '&') out += "&amp;";
+        else if (safe && c < 0x80U) out.push_back(static_cast<char>(c));
         else {
             out.push_back('%');
             out.push_back(hex[c >> 4U]);
             out.push_back(hex[c & 0x0FU]);
         }
     }
-    return out;
 }
 
 std::string_view alignment_name(TableAlignment alignment) noexcept {
@@ -77,127 +90,63 @@ std::string_view alignment_name(TableAlignment alignment) noexcept {
 
 class HtmlRenderer {
 public:
-    HtmlRenderer(const Document& document, HtmlOptions options)
-        : document_(document), options_(options) {}
+    HtmlRenderer(const Document& document, HtmlOptions options, std::string& out)
+        : document_(document), options_(options), out_(out) {}
 
-    std::string run() {
-        const auto& root = document_.node(document_.root());
-        for (auto child = root.first_child; child != npos; child = document_.node(child).next) render_block(child);
-        return std::move(out_);
+    void run() {
+        out_.clear();
+        out_.reserve(std::min(document_.source().size(), document_.size() * 64));
+        detail::walk(document_, [&](NodeId id, std::size_t) { return enter(id); },
+                     [&](NodeId id, std::size_t) { leave(id); });
     }
 
 private:
-    void render_children_inline(const Node& node) {
-        for (auto child = node.first_child; child != npos; child = document_.node(child).next) render_inline(child);
-    }
-
     bool tight_paragraph(const Node& node) const {
         if (node.parent == npos) return false;
         const auto& parent = document_.node(node.parent);
-        if (parent.type != NodeType::item || parent.parent == npos) return false;
-        return document_.node(parent.parent).tight;
+        return parent.type == NodeType::item && parent.parent != npos && document_.node(parent.parent).tight;
     }
-
+    bool header_cell(const Node& node) const {
+        const auto row = document_.node(node.parent).parent;
+        return row != npos && document_.node(row).type == NodeType::table_head;
+    }
     void render_checkbox(const Node& item) {
         out_ += "<input";
         if (item.checked) out_ += " checked=\"\"";
         out_ += " disabled=\"\" type=\"checkbox\"> ";
     }
-
-    void render_table_row(NodeId id, bool header) {
-        const auto& row = document_.node(id);
-        out_ += "<tr>\n";
-        for (auto cell_id = row.first_child; cell_id != npos; cell_id = document_.node(cell_id).next) {
-            const auto& cell = document_.node(cell_id);
-            out_ += header ? "<th" : "<td";
-            if (cell.alignment != TableAlignment::none) {
-                out_ += " align=\"";
-                out_ += alignment_name(cell.alignment);
-                out_ += "\"";
-            }
-            out_ += ">";
-            render_children_inline(cell);
-            out_ += header ? "</th>\n" : "</td>\n";
-        }
-        out_ += "</tr>\n";
+    void append_alt(NodeId id) {
+        detail::walk(document_, [&](NodeId child, std::size_t) {
+            const auto& value = document_.node(child);
+            if (value.type == NodeType::text || value.type == NodeType::code) append_escaped(out_, value.literal, true);
+            else if (value.type == NodeType::soft_break || value.type == NodeType::line_break) out_.push_back('\n');
+            return true;
+        }, [](NodeId, std::size_t) {}, id);
     }
-
-    void render_table(const Node& table) {
-        out_ += "<table>\n";
-        const auto head = table.first_child;
-        if (head != npos) {
-            out_ += "<thead>\n";
-            for (auto row = document_.node(head).first_child; row != npos; row = document_.node(row).next)
-                render_table_row(row, true);
-            out_ += "</thead>\n";
-            const auto body = document_.node(head).next;
-            if (body != npos && document_.node(body).first_child != npos) {
-                out_ += "<tbody>\n";
-                for (auto row = document_.node(body).first_child; row != npos; row = document_.node(row).next)
-                    render_table_row(row, false);
-                out_ += "</tbody>\n";
-            }
-        }
-        out_ += "</table>\n";
-    }
-
-    void render_item(const Node& item) {
-        out_ += "<li>";
-        auto child = item.first_child;
-        if (child == npos) {
-            out_ += "</li>\n";
-            return;
-        }
-        bool first = true;
-        while (child != npos) {
-            const auto& block = document_.node(child);
-            const bool direct = block.type == NodeType::paragraph && tight_paragraph(block);
-            const bool needs_newline = (first && !direct) ||
-                (!first && !out_.empty() && out_.back() != '\n');
-            if (needs_newline) out_.push_back('\n');
-            render_block(child);
-            first = false;
-            child = block.next;
-        }
-        out_ += "</li>\n";
-    }
-
-    void render_block(NodeId id) {
+    bool enter(NodeId id) {
         const auto& node = document_.node(id);
+        if (node.parent != npos && document_.node(node.parent).type == NodeType::item) {
+            const bool direct = node.type == NodeType::paragraph && tight_paragraph(node);
+            if ((node.previous == npos && !direct) ||
+                (node.previous != npos && !out_.empty() && out_.back() != '\n')) out_.push_back('\n');
+        }
         switch (node.type) {
-        case NodeType::block_quote:
-            out_ += "<blockquote>\n";
-            for (auto child = node.first_child; child != npos; child = document_.node(child).next) render_block(child);
-            out_ += "</blockquote>\n";
-            break;
+        case NodeType::block_quote: out_ += "<blockquote>\n"; break;
         case NodeType::list:
             if (node.list_kind == ListKind::ordered) {
                 out_ += "<ol";
                 if (node.number != 1) out_ += " start=\"" + std::to_string(node.number) + "\"";
                 out_ += ">\n";
-            } else {
-                out_ += "<ul>\n";
-            }
-            for (auto child = node.first_child; child != npos; child = document_.node(child).next) render_item(document_.node(child));
-            out_ += node.list_kind == ListKind::ordered ? "</ol>\n" : "</ul>\n";
+            } else out_ += "<ul>\n";
             break;
-        case NodeType::item:
-            render_item(node);
-            break;
-        case NodeType::thematic_break:
-            out_ += options_.xhtml ? "<hr />\n" : "<hr>\n";
-            break;
-        case NodeType::heading:
-            out_ += "<h" + std::to_string(node.number) + ">";
-            render_children_inline(node);
-            out_ += "</h" + std::to_string(node.number) + ">\n";
-            break;
+        case NodeType::item: out_ += "<li>"; break;
+        case NodeType::thematic_break: out_ += options_.xhtml ? "<hr />\n" : "<hr>\n"; break;
+        case NodeType::heading: out_ += "<h" + std::to_string(node.number) + ">"; break;
         case NodeType::code_block:
             out_ += "<pre><code";
             if (!node.title.empty()) {
-                const auto end = node.title.find_first_of(" \t\n");
                 out_ += " class=\"language-";
-                append_escaped(out_, node.title.substr(0, end), true);
+                append_escaped(out_, std::string_view(node.title).substr(0, node.title.find_first_of(" \t\n")), true);
                 out_ += "\"";
             }
             out_ += ">";
@@ -205,6 +154,7 @@ private:
             out_ += "</code></pre>\n";
             break;
         case NodeType::html_block:
+        case NodeType::html_inline:
             if (options_.escape_raw_html) append_escaped(out_, node.literal);
             else out_ += node.literal;
             break;
@@ -212,90 +162,71 @@ private:
             if (!tight_paragraph(node)) out_ += "<p>";
             if (node.parent != npos) {
                 const auto& parent = document_.node(node.parent);
-                if (parent.type == NodeType::item && parent.task && parent.first_child == id)
-                    render_checkbox(parent);
+                if (parent.type == NodeType::item && parent.task && parent.first_child == id) render_checkbox(parent);
             }
-            render_children_inline(node);
-            if (!tight_paragraph(node)) out_ += "</p>\n";
             break;
-        case NodeType::table:
-            render_table(node);
+        case NodeType::table: out_ += "<table>\n"; break;
+        case NodeType::table_head: out_ += "<thead>\n"; break;
+        case NodeType::table_body:
+            if (node.first_child != npos) out_ += "<tbody>\n";
             break;
-        case NodeType::document:
-            for (auto child = node.first_child; child != npos; child = document_.node(child).next) render_block(child);
+        case NodeType::table_row: out_ += "<tr>\n"; break;
+        case NodeType::table_cell:
+            out_ += header_cell(node) ? "<th" : "<td";
+            if (node.alignment != TableAlignment::none) {
+                out_ += " align=\""; out_ += alignment_name(node.alignment); out_ += "\"";
+            }
+            out_ += ">";
             break;
-        default:
-            render_inline(id);
-            break;
-        }
-    }
-
-    void append_alt(const Node& node) {
-        for (auto child = node.first_child; child != npos; child = document_.node(child).next) {
-            const auto& value = document_.node(child);
-            if (value.type == NodeType::text || value.type == NodeType::code) append_escaped(out_, value.literal, true);
-            else if (value.type == NodeType::soft_break || value.type == NodeType::line_break) out_.push_back('\n');
-            else if (value.first_child != npos) append_alt(value);
-        }
-    }
-
-    void render_inline(NodeId id) {
-        const auto& node = document_.node(id);
-        switch (node.type) {
         case NodeType::text: append_escaped(out_, node.literal); break;
         case NodeType::soft_break: out_ += options_.soft_break_as_space ? " " : "\n"; break;
         case NodeType::line_break: out_ += options_.xhtml ? "<br />\n" : "<br>\n"; break;
         case NodeType::code:
-            out_ += "<code>";
-            append_escaped(out_, node.literal);
-            out_ += "</code>";
-            break;
-        case NodeType::html_inline:
-            if (options_.escape_raw_html) append_escaped(out_, node.literal);
-            else out_ += node.literal;
-            break;
-        case NodeType::emphasis:
-            out_ += "<em>"; render_children_inline(node); out_ += "</em>"; break;
-        case NodeType::strong:
-            out_ += "<strong>"; render_children_inline(node); out_ += "</strong>"; break;
-        case NodeType::strikethrough:
-            out_ += "<del>"; render_children_inline(node); out_ += "</del>"; break;
+            out_ += "<code>"; append_escaped(out_, node.literal); out_ += "</code>"; break;
+        case NodeType::emphasis: out_ += "<em>"; break;
+        case NodeType::strong: out_ += "<strong>"; break;
+        case NodeType::strikethrough: out_ += "<del>"; break;
         case NodeType::link:
-            out_ += "<a href=\"";
-            append_escaped(out_, percent_encode_url(node.literal), true);
-            out_ += "\"";
-            if (!node.title.empty()) {
-                out_ += " title=\"";
-                append_escaped(out_, node.title, true);
-                out_ += "\"";
-            }
-            out_ += ">"; render_children_inline(node); out_ += "</a>";
-            break;
         case NodeType::image:
-            out_ += "<img src=\"";
-            append_escaped(out_, percent_encode_url(node.literal), true);
-            out_ += "\" alt=\"";
-            append_alt(node);
+            out_ += node.type == NodeType::link ? "<a href=\"" : "<img src=\"";
+            append_url(out_, node.literal);
             out_ += "\"";
-            if (!node.title.empty()) {
-                out_ += " title=\"";
-                append_escaped(out_, node.title, true);
-                out_ += "\"";
-            }
-            out_ += options_.xhtml ? " />" : ">";
-            break;
-        default: render_children_inline(node); break;
+            if (node.type == NodeType::image) { out_ += " alt=\""; append_alt(id); out_ += "\""; }
+            if (!node.title.empty()) { out_ += " title=\""; append_escaped(out_, node.title, true); out_ += "\""; }
+            out_ += node.type == NodeType::image && options_.xhtml ? " />" : ">";
+            return node.type == NodeType::link;
+        default: break;
+        }
+        return true;
+    }
+    void leave(NodeId id) {
+        const auto& node = document_.node(id);
+        switch (node.type) {
+        case NodeType::block_quote: out_ += "</blockquote>\n"; break;
+        case NodeType::list: out_ += node.list_kind == ListKind::ordered ? "</ol>\n" : "</ul>\n"; break;
+        case NodeType::item: out_ += "</li>\n"; break;
+        case NodeType::heading: out_ += "</h" + std::to_string(node.number) + ">\n"; break;
+        case NodeType::paragraph: if (!tight_paragraph(node)) out_ += "</p>\n"; break;
+        case NodeType::table: out_ += "</table>\n"; break;
+        case NodeType::table_head: out_ += "</thead>\n"; break;
+        case NodeType::table_body: if (node.first_child != npos) out_ += "</tbody>\n"; break;
+        case NodeType::table_row: out_ += "</tr>\n"; break;
+        case NodeType::table_cell: out_ += header_cell(node) ? "</th>\n" : "</td>\n"; break;
+        case NodeType::emphasis: out_ += "</em>"; break;
+        case NodeType::strong: out_ += "</strong>"; break;
+        case NodeType::strikethrough: out_ += "</del>"; break;
+        case NodeType::link: out_ += "</a>"; break;
+        default: break;
         }
     }
-
     const Document& document_;
     HtmlOptions options_;
-    std::string out_;
+    std::string& out_;
 };
 
-void render_ast_node(const Document& document, NodeId id, std::string& out, int depth, bool pretty) {
+void render_ast_enter(const Document& document, NodeId id, std::string& out, std::size_t depth, bool pretty) {
     const auto& node = document.node(id);
-    const auto indent = [&](int extra = 0) {
+    const auto indent = [&](std::size_t extra = 0) {
         if (pretty) out.append(static_cast<std::size_t>(depth + extra) * 2, ' ');
     };
     if (pretty) out.append(static_cast<std::size_t>(depth) * 2, ' ');
@@ -321,15 +252,19 @@ void render_ast_node(const Document& document, NodeId id, std::string& out, int 
     }
     if (node.first_child != npos) {
         out += ","; if (pretty) out += "\n"; indent(1); out += "\"children\": ["; if (pretty) out += "\n";
-        for (auto child = node.first_child; child != npos; child = document.node(child).next) {
-            render_ast_node(document, child, out, depth + 2, pretty);
-            if (document.node(child).next != npos) out += ",";
-            if (pretty) out += "\n";
-        }
-        indent(1); out += "]";
     }
-    if (pretty) { out += "\n"; indent(); }
+}
+
+void render_ast_leave(const Document& document, NodeId id, std::string& out, std::size_t depth, bool pretty) {
+    const auto& node = document.node(id);
+    if (node.first_child != npos) {
+        if (pretty) out.append((depth + 1) * 2, ' ');
+        out += "]";
+    }
+    if (pretty) { out += "\n"; out.append(depth * 2, ' '); }
     out += "}";
+    if (node.next != npos) out += ",";
+    if (pretty && node.parent != npos) out += "\n";
 }
 
 void append_event_attributes(std::string& out, const Node& node) {
@@ -349,51 +284,65 @@ void append_event_attributes(std::string& out, const Node& node) {
     if (node.type == NodeType::code_block && !node.title.empty()) { out += " info="; append_json_string(out, node.title); }
 }
 
-void render_event_node(const Document& document, NodeId id, std::string& out) {
-    const auto& node = document.node(id);
-    if (detail::is_textual(node.type)) {
-        out += "text "; out += node_type_name(node.type); out += " "; append_json_string(out, node.literal); out += "\n";
-        return;
-    }
-    out += "enter "; out += node_type_name(node.type); append_event_attributes(out, node); out += "\n";
-    for (auto child = node.first_child; child != npos; child = document.node(child).next) render_event_node(document, child, out);
-    out += "leave "; out += node_type_name(node.type); out += "\n";
-}
-
-void walk_node(const Document& document, NodeId id, EventHandler& handler) {
-    const auto& node = document.node(id);
-    if (detail::is_textual(node.type)) {
-        handler.text(node);
-        return;
-    }
-    handler.enter(node);
-    for (auto child = node.first_child; child != npos; child = document.node(child).next) walk_node(document, child, handler);
-    handler.leave(node);
-}
-
 } // namespace
 
-std::string render_html(const Document& document, HtmlOptions options) {
-    return HtmlRenderer(document, options).run();
+void render_html_to(const Document& document, std::string& out, HtmlOptions options) {
+    HtmlRenderer(document, options, out).run();
 }
-
+std::string render_html(const Document& document, HtmlOptions options) {
+    std::string out;
+    render_html_to(document, out, options);
+    return out;
+}
+void render_ast_to(const Document& document, std::string& out, bool pretty) {
+    out.clear();
+    out.reserve(document.size() * 80);
+    detail::walk(document, [&](NodeId id, std::size_t depth) {
+        render_ast_enter(document, id, out, depth * 2, pretty);
+        return true;
+    }, [&](NodeId id, std::size_t depth) {
+        render_ast_leave(document, id, out, depth * 2, pretty);
+    });
+    if (pretty) out.push_back('\n');
+}
 std::string render_ast(const Document& document, bool pretty) {
     std::string out;
-    out.reserve(document.size() * 80);
-    render_ast_node(document, document.root(), out, 0, pretty);
-    if (pretty) out.push_back('\n');
+    render_ast_to(document, out, pretty);
     return out;
 }
-
+void render_events_to(const Document& document, std::string& out) {
+    out.clear();
+    out.reserve(document.size() * 32);
+    detail::walk(document, [&](NodeId id, std::size_t) {
+        const auto& node = document.node(id);
+        if (detail::is_textual(node.type)) {
+            out += "text "; out += node_type_name(node.type); out += " ";
+            append_json_string(out, node.literal); out += "\n";
+            return false;
+        }
+        out += "enter "; out += node_type_name(node.type); append_event_attributes(out, node); out += "\n";
+        return true;
+    }, [&](NodeId id, std::size_t) {
+        const auto& node = document.node(id);
+        if (!detail::is_textual(node.type)) {
+            out += "leave "; out += node_type_name(node.type); out += "\n";
+        }
+    });
+}
 std::string render_events(const Document& document) {
     std::string out;
-    out.reserve(document.size() * 32);
-    render_event_node(document, document.root(), out);
+    render_events_to(document, out);
     return out;
 }
-
 void walk_events(const Document& document, EventHandler& handler) {
-    walk_node(document, document.root(), handler);
+    detail::walk(document, [&](NodeId id, std::size_t) {
+        const auto& node = document.node(id);
+        if (detail::is_textual(node.type)) { handler.text(node); return false; }
+        handler.enter(node);
+        return true;
+    }, [&](NodeId id, std::size_t) {
+        const auto& node = document.node(id);
+        if (!detail::is_textual(node.type)) handler.leave(node);
+    });
 }
-
 } // namespace chmd

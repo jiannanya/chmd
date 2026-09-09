@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`chmd` is a zero-runtime-dependency, C++20, UTF-8-first CommonMark parser. Its core is an entirely independent implementation built around a two-pass parsing strategy and an efficient callback interface.
+`chmd` is a zero-runtime-dependency, C++20, UTF-8-first CommonMark parser. Its core is an entirely independent implementation with a callback interface.
 
 The current release implements the complete CommonMark 0.31.2 core and passes all **652/652** examples in the official `spec.json` fixture. Extended Markdown syntax is enabled by default and can be disabled as a bundle or feature by feature. The library provides:
 
@@ -29,7 +29,7 @@ Common build options:
 
 ```text
 CHMD_BUILD_TESTS=ON          Build unit, boundary, and conformance tests
-CHMD_BUILD_BENCHMARKS=OFF   Build the 1 MiB microbenchmark
+CHMD_BUILD_BENCHMARKS=OFF   Build the microbenchmark suite
 CHMD_ENABLE_SANITIZERS=OFF  ASan+UBSan on Linux/macOS; ASan on MSVC; UBSan on Windows Clang
 CHMD_BUILD_FUZZER=OFF       Build the libFuzzer target with Clang
 ```
@@ -53,9 +53,22 @@ int main() {
 }
 ```
 
-`Document` stores nodes in one contiguous `std::vector<Node>` arena. Parent, child, and sibling relationships use 32-bit indices, so moving a document does not invalidate its tree relationships and nodes do not need individually allocated child containers. Source text is normalized and stored once: CRLF and CR become LF, while NUL is replaced with U+FFFD as required by the specification.
+`Document` stores nodes in a `std::vector<Node>` arena. Parent, child, and sibling relationships use 32-bit indices; moving a document preserves those relationships. Source text is normalized: CRLF and CR become LF, while NUL is replaced with U+FFFD as required by the specification.
 
-For structured streaming, derive from `EventHandler` and call `Parser::parse_events()`. Callbacks are strictly nested: non-text nodes receive `enter` and `leave`, while text, code, line breaks, and raw HTML receive `text`.
+The `_to` rendering functions write into a supplied string, replacing its contents:
+
+```cpp
+std::string output;
+chmd::render_html_to(result.document, output);
+chmd::render_ast_to(result.document, output, false);
+chmd::render_events_to(result.document, output);
+```
+
+`Document::capacity()` reports arena capacity in nodes. `Document::shrink_to_fit()` requests a reduction in node and string capacity; it preserves node indices but may invalidate node references and spans.
+
+`max_nesting` limits the complete block and inline tree, counting the root and text leaves. Zero disables the limit. Pretty AST indentation grows with nesting depth; use `render_ast(document, false)` or `--compact` for deep documents.
+
+For structured streaming, derive from `EventHandler` and call `Parser::parse_events()`. Callbacks are strictly nested: non-text nodes receive `enter` and `leave`, while text, code, line breaks, and raw HTML receive `text`. `parse_events()` builds the full document before invoking callbacks; it is not incremental parsing. Text callback boundaries are not a fixed tokenization contract; combine text in event order as needed.
 
 Tables, strikethrough, and task lists are enabled in `ParseOptions::extensions` by default. Each feature can be switched independently. To request strict CommonMark parsing through the API:
 
@@ -77,6 +90,18 @@ chmd --commonmark input.md     # Disable all extended syntax
 chmd --no-tables input.md      # Disable one extension independently
 ```
 
+Additional CLI options:
+
+```sh
+chmd -
+chmd -- --input.md
+chmd --to ast --compact input.md
+chmd --html5 --soft-break-as-space input.md
+chmd --max-input-bytes 1048576 --max-nodes 100000 --max-nesting 128 input.md
+```
+
+The byte limit applies while reading input. Zero disables a configured limit. Node limits include temporary arena slots during parsing. Exit codes are 0 for success, 1 for parsing/resource/I/O errors, and 2 for invalid arguments or file-open failures. In permissive UTF-8 mode, JSON/event strings replace invalid bytes with `\ufffd`.
+
 The other individual switches are `--no-strikethrough` and `--no-task-lists`.
 
 When no file is specified, or when the input is `-`, the command reads from standard input. On Windows, standard input and output use binary mode so HTML and conformance results retain LF line endings instead of being rewritten to CRLF by the CRT.
@@ -94,17 +119,7 @@ leave paragraph
 leave document
 ```
 
-## Implementation and performance
-
-Parsing is divided into block and inline passes. The block scanner maintains a stack of open containers; the inline scanner maintains delimiter stacks for emphasis, strikethrough, and links. Backtick runs are pre-indexed, and emphasis matching records lower bounds for opener searches to avoid repeated whole-input rescans. Tables are recognized from a single header and delimiter row, then body rows are normalized to the declared column count without retaining ignored excess cells. Tabs participate in structural parsing at four-column tab stops, and unconsumed columns crossing structural boundaries are returned to the content as spaces.
-
-The implementation priorities are performance first, memory use second, and binary/source footprint third:
-
-1. Hand-written scanners handle ASCII hot paths without `std::regex`;
-2. The AST uses a contiguous arena and index relationships to avoid pointer-tree allocation fragmentation;
-3. HTML5 entities and Unicode whitespace, punctuation, and case-folding data are generated before compilation and stored as compact sorted tables;
-4. The runtime needs no external data files, while the core source and generated tables remain within a few hundred KiB;
-5. `ParseOptions` supplies resource limits for untrusted input.
+## Benchmarks
 
 Run the local microbenchmark with:
 
@@ -114,7 +129,7 @@ cmake --build build-bench --parallel
 ./build-bench/chmd_benchmark
 ```
 
-The benchmark repeatedly parses approximately 1 MiB of mixed headings, lists, links, emphasis, code spans, and entities, then reports throughput in MiB/s. HTML serialization time is intentionally excluded from the parsing result.
+The benchmark covers 16 workloads and defaults to 10 rounds per case; pass a positive integer as its first argument to change the round count. CSV output includes separate parsing and HTML timings, node counts, and requested heap allocation statistics. Heap counters exclude caller input, allocator metadata, and stack; they are not process RSS.
 
 ## Tests and specification fixture
 

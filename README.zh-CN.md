@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-`chmd` 是一个零运行时依赖、C++20、UTF-8 优先的 CommonMark 解析库。核心为完全独立的自研实现，采用两遍解析策略并提供高效的回调接口。
+`chmd` 是一个零运行时依赖、C++20、UTF-8 优先的 CommonMark 解析库。核心为完全独立的自研实现，并提供回调接口。
 
 当前版本完整实现 CommonMark 0.31.2 核心，并通过官方 `spec.json` 的全部 **652/652** 个示例。扩展 Markdown 语法默认开启，既可整体关闭，也可逐项控制。库同时提供：
 
@@ -29,7 +29,7 @@ ctest --test-dir build --output-on-failure
 
 ```text
 CHMD_BUILD_TESTS=ON          构建单元、边界和规范测试
-CHMD_BUILD_BENCHMARKS=OFF   构建 1 MiB 微基准
+CHMD_BUILD_BENCHMARKS=OFF   构建微基准套件
 CHMD_ENABLE_SANITIZERS=OFF  Linux/macOS 启用 ASan+UBSan；MSVC 启用 ASan；Windows Clang 启用 UBSan
 CHMD_BUILD_FUZZER=OFF       Clang 下构建 libFuzzer 目标
 ```
@@ -53,9 +53,22 @@ int main() {
 }
 ```
 
-`Document` 使用一个连续 `std::vector<Node>` 作为节点 arena。父子和兄弟关系均为 32 位索引，移动文档不会让节点关系失效，也没有每个节点单独分配的子节点容器。源文本仅规范化并保存一份；CRLF/CR 统一为 LF，NUL 按规范替换为 U+FFFD。
+`Document` 使用 `std::vector<Node>` 作为节点 arena。父子和兄弟关系均为 32 位索引，移动文档不会让节点关系失效。源文本经过规范化：CRLF/CR 统一为 LF，NUL 按规范替换为 U+FFFD。
 
-需要结构化流时，可继承 `EventHandler` 并调用 `Parser::parse_events()`。回调顺序严格嵌套：非文本节点收到 `enter` / `leave`，文本、代码、换行和原始 HTML 收到 `text`。
+`_to` 渲染接口将结果写入调用方提供的字符串：
+
+```cpp
+std::string output;
+chmd::render_html_to(result.document, output);
+chmd::render_ast_to(result.document, output, false);
+chmd::render_events_to(result.document, output);
+```
+
+三个 `_to` 接口均覆盖已有内容，也可使用返回 `std::string` 的渲染接口。`document.shrink_to_fit()` 请求收缩节点和字符串容量；该操作保留节点索引，但可能使节点引用和 `span` 失效。`document.capacity()` 返回节点 arena 的容量（以节点为单位）。
+
+`max_nesting` 同时约束块和最终行内树，根节点计为一层，文本叶节点也计入层数；零表示不限。`parse_events()` 仍先构建完整文档再回调，不能作为增量解析器使用。格式化 AST 的缩进空间随嵌套深度增长，极深文档应使用 `render_ast(document, false)` 或 `--compact`。
+
+需要结构化流时，可继承 `EventHandler` 并调用 `Parser::parse_events()`。回调顺序严格嵌套：非文本节点收到 `enter` / `leave`，文本、代码、换行和原始 HTML 收到 `text`。文本回调的分段不作为固定接口约定；调用方应按事件顺序组合文本内容。
 
 表格、删除线和任务列表在 `ParseOptions::extensions` 中默认开启，并可逐项关闭。通过 API 请求严格 CommonMark 解析：
 
@@ -77,6 +90,18 @@ chmd --commonmark input.md     # 关闭全部扩展语法
 chmd --no-tables input.md      # 单独关闭表格
 ```
 
+还支持：
+
+```sh
+chmd -                         # 显式读取标准输入
+chmd -- --input.md              # 读取以连字符开头的文件名
+chmd --to ast --compact input.md
+chmd --html5 --soft-break-as-space input.md
+chmd --max-input-bytes 1048576 --max-nodes 100000 --max-nesting 128 input.md
+```
+
+输入字节限制在读取阶段就生效。资源限制的零值表示不限，节点限制包含解析期间的临时 arena 槽位。参数错误/文件打开失败返回 2，解析、读写或内存错误返回 1，成功返回 0。宽松 UTF-8 模式下，AST JSON 和事件字符串中的非法字节以 `\ufffd` 输出，保证结构化输出仍为合法 UTF-8；严格模式会拒绝输入。
+
 另外两个独立开关为 `--no-strikethrough` 和 `--no-task-lists`。
 
 不指定文件或使用 `-` 时从标准输入读取。Windows 下标准输入输出以二进制模式打开，因此 HTML 与规范测试始终使用 LF，不被 CRT 改写成 CRLF。
@@ -94,17 +119,7 @@ leave paragraph
 leave document
 ```
 
-## 实现与性能取向
-
-解析分为块级和行内两层：块级扫描维护开放容器栈，行内扫描维护强调、删除线与链接定界符栈。反引号运行预索引，强调匹配记录 opener 下界，避免常见的重复全串回扫。表格由单行表头与分隔行识别，正文行按声明列数规范化，超出列不会被保留。制表符按 4 列 tab stop 参与结构判断；跨越结构边界时未消费的列会回流为内容空格。
-
-优先级按“性能、内存、产物空间”排序：
-
-1. ASCII 热路径使用手写扫描器，不使用 `std::regex`；
-2. AST 采用连续 arena 和索引关系，避免指针树的碎片化分配；
-3. HTML5 实体、Unicode 空白/标点和 case-fold 表在构建前生成并以排序紧凑表编译进库；
-4. 运行时无外部数据文件，核心源代码和生成表保持在数百 KiB 量级；
-5. `ParseOptions` 可为不可信输入设置资源上限。
+## 基准测试
 
 运行本机微基准：
 
@@ -114,7 +129,7 @@ cmake --build build-bench --parallel
 ./build-bench/chmd_benchmark
 ```
 
-微基准会重复解析约 1 MiB 的标题、列表、链接、强调、代码跨度和实体混合输入，并输出 MiB/s。它不把 HTML 序列化耗时混入解析数字。
+微基准默认每组重复 10 次，可用 `chmd_benchmark 20` 修改轮数。CSV 覆盖混合文本、普通段落、空行、表格、引用、HTML 注释以及多种不匹配定界符。解析与 HTML 渲染分别计时，同时输出节点数、保留堆字节、峰值堆字节和分配次数。堆指标为基准程序通过普通 `new`/`delete` 记录的申请量，排除调用方输入、分配器元数据和线程栈；它不是进程 RSS。
 
 ## 测试与规范来源
 
@@ -122,6 +137,9 @@ cmake --build build-bench --parallel
 - `tests/test_main.cpp`：公共 API、主要语义、扩展语法和错误限制单元测试；
 - `tests/test_extensions.cpp`：表格、任务列表、删除线、功能开关和结构化输出元数据测试；
 - `tests/test_boundaries.cpp`：树关系不变量、2500 组确定性随机混合字节、深度/节点限制和对抗性输入；
+- `tests/test_regressions.cpp`：深层非递归遍历、arena 可达性、内存容量和退化扫描回归；
+- `tests/test_cli.py`：参数、资源限制、文件与标准输入、JSON 输出验证；
+- `tests/package`：已安装 CMake 包的下游消费测试；
 - `tests/fuzz_parser.cpp`：解析及三种输出的 libFuzzer 入口；
 - `tools/generate_tables.py`：可重复生成 HTML5 实体和 Unicode 分类/折叠表。
 

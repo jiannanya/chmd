@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(chmd VERSION 1.1.0 LANGUAGES CXX)
+project(chmd VERSION 1.2.0 LANGUAGES CXX)
+include(GNUInstallDirs)
 
 option(CHMD_BUILD_TESTS "Build the test suite" ON)
 option(CHMD_BUILD_BENCHMARKS "Build the micro-benchmark" OFF)
@@ -25,7 +26,7 @@ target_compile_features(chmd PUBLIC cxx_std_20)
 target_include_directories(chmd
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE src
 )
 set_target_properties(chmd PROPERTIES
@@ -33,6 +34,7 @@ set_target_properties(chmd PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 if(MSVC)
@@ -48,19 +50,25 @@ if(CHMD_ENABLE_SANITIZERS)
     elseif(WIN32)
         # LLVM 17's MSVC-ABI ASan runtime cannot intercept the current Windows
         # CRT reliably; UBSan remains fully supported with the dynamic CRT.
-        target_compile_options(chmd PUBLIC -fsanitize=undefined -fno-omit-frame-pointer)
+        target_compile_options(chmd PUBLIC -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
         target_link_options(chmd PUBLIC -fsanitize=undefined)
     else()
-        target_compile_options(chmd PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_compile_options(chmd PUBLIC -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
         target_link_options(chmd PUBLIC -fsanitize=address,undefined)
     endif()
 endif()
 
 add_executable(chmd_cli app/chmd_cli.cpp)
 target_link_libraries(chmd_cli PRIVATE chmd::chmd)
-set_target_properties(chmd_cli PROPERTIES OUTPUT_NAME chmd)
+set_target_properties(chmd_cli PROPERTIES
+    OUTPUT_NAME chmd
+    # Windows sanitizer runtimes can export symbols from the executable.
+    # Its import library must not overwrite the actual chmd.lib library.
+    ARCHIVE_OUTPUT_NAME chmd_cli
+    PDB_NAME chmd_cli
+    COMPILE_PDB_NAME chmd_cli
+)
 
-include(GNUInstallDirs)
 install(TARGETS chmd chmd_cli EXPORT chmdTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -93,9 +101,18 @@ if(CHMD_BUILD_TESTS)
     add_executable(chmd_extension_tests tests/test_extensions.cpp)
     target_link_libraries(chmd_extension_tests PRIVATE chmd::chmd)
     add_test(NAME chmd_extensions COMMAND chmd_extension_tests)
-    set_tests_properties(chmd_unit chmd_boundaries chmd_extensions PROPERTIES TIMEOUT 60)
+    add_executable(chmd_regression_tests tests/test_regressions.cpp)
+    target_link_libraries(chmd_regression_tests PRIVATE chmd::chmd)
+    add_test(NAME chmd_regressions COMMAND chmd_regression_tests)
+    set_tests_properties(chmd_unit chmd_boundaries chmd_extensions chmd_regressions PROPERTIES TIMEOUT 60)
 
     find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME chmd_cli_options
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.py
+                    $<TARGET_FILE:chmd_cli>)
+        set_tests_properties(chmd_cli_options PROPERTIES TIMEOUT 60)
+    endif()
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spec.json")
         add_test(NAME chmd_commonmark_0_31_2
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_spec.py
@@ -107,8 +124,12 @@ if(CHMD_BUILD_TESTS)
     if(CHMD_ENABLE_SANITIZERS AND MSVC)
         # Some recent Windows CRT builds expose non-interceptable thunks. ASan
         # can safely continue after reporting those startup-only misses.
-        set_tests_properties(chmd_unit chmd_boundaries chmd_extensions PROPERTIES
+        set_tests_properties(chmd_unit chmd_boundaries chmd_extensions chmd_regressions PROPERTIES
             ENVIRONMENT "ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1")
+        if(TEST chmd_cli_options)
+            set_tests_properties(chmd_cli_options PROPERTIES
+                ENVIRONMENT "ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1")
+        endif()
         if(TEST chmd_commonmark_0_31_2)
             set_tests_properties(chmd_commonmark_0_31_2 PROPERTIES
                 ENVIRONMENT "ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1")
@@ -121,10 +142,12 @@ if(CHMD_BUILD_FUZZER)
         message(FATAL_ERROR "CHMD_BUILD_FUZZER requires Clang")
     endif()
     if(WIN32)
-        target_compile_options(chmd PRIVATE -fsanitize=fuzzer-no-link,undefined -fno-omit-frame-pointer)
+        target_compile_options(chmd PRIVATE -fsanitize=fuzzer-no-link,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+        target_link_options(chmd INTERFACE -fsanitize=fuzzer-no-link,undefined)
         set(CHMD_FUZZ_SANITIZERS fuzzer,undefined)
     else()
-        target_compile_options(chmd PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+        target_compile_options(chmd PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+        target_link_options(chmd INTERFACE -fsanitize=fuzzer-no-link,address,undefined)
         set(CHMD_FUZZ_SANITIZERS fuzzer,address,undefined)
     endif()
     add_executable(chmd_fuzzer tests/fuzz_parser.cpp)

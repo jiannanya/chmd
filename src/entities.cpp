@@ -27,7 +27,9 @@ std::uint32_t parse_numeric(std::string_view digits, unsigned base, bool& valid)
         if (c >= '0' && c <= '9') digit = static_cast<unsigned>(c - '0');
         else if (c >= 'a' && c <= 'f') digit = static_cast<unsigned>(c - 'a' + 10);
         else if (c >= 'A' && c <= 'F') digit = static_cast<unsigned>(c - 'A' + 10);
-        if (digit >= base || value > (0x10FFFFU - digit) / base) { valid = false; return 0; }
+        // Syntax limits this to seven decimal or six hexadecimal digits, both
+        // of which fit uint32_t. Out-of-Unicode-range values become U+FFFD.
+        if (digit >= base) { valid = false; return 0; }
         value = value * base + digit;
     }
     if (value == 0 || value > 0x10FFFFU || (value >= 0xD800U && value <= 0xDFFFU)) return 0xFFFDU;
@@ -84,14 +86,16 @@ std::uint32_t decode_utf8_before(std::string_view text, std::size_t offset) noex
 }
 
 bool is_unicode_whitespace(std::uint32_t cp) noexcept {
+    if (cp < 0x80U) return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\f' || cp == '\r';
     return in_ranges(cp, whitespace_ranges);
 }
 
 bool is_unicode_punctuation(std::uint32_t cp) noexcept {
-    return ascii_punctuation(cp) || in_ranges(cp, punctuation_ranges);
+    return cp < 0x80U ? ascii_punctuation(cp) : in_ranges(cp, punctuation_ranges);
 }
 
 std::string unescape_entities(std::string_view input) {
+    if (input.find('&') == std::string_view::npos) return std::string(input);
     std::string out;
     out.reserve(input.size());
     for (std::size_t i = 0; i < input.size();) {
@@ -99,11 +103,12 @@ std::string unescape_entities(std::string_view input) {
             out.push_back(input[i++]);
             continue;
         }
-        const auto semicolon = input.find(';', i + 1);
-        if (semicolon == std::string_view::npos || semicolon - i > 33) {
+        const auto relative = input.substr(i + 1, 33).find(';');
+        if (relative == std::string_view::npos) {
             out.push_back(input[i++]);
             continue;
         }
+        const auto semicolon = i + 1 + relative;
         const auto body = input.substr(i + 1, semicolon - i - 1);
         if (body.starts_with('#')) {
             const bool hex = body.size() >= 2 && (body[1] == 'x' || body[1] == 'X');
@@ -146,6 +151,11 @@ std::string normalize_reference(std::string_view label) {
             continue;
         }
         if (pending_space) { out.push_back(' '); pending_space = false; }
+        if (cp < 0x80U) {
+            out.push_back(static_cast<char>(cp >= 'A' && cp <= 'Z' ? cp + ('a' - 'A') : cp));
+            i += width;
+            continue;
+        }
         const auto* fold = std::lower_bound(std::begin(case_folds), std::end(case_folds), cp,
             [](const Fold& item, std::uint32_t value) { return item.source < value; });
         if (fold != std::end(case_folds) && fold->source == cp) {
@@ -153,7 +163,7 @@ std::string normalize_reference(std::string_view label) {
             if (fold->count > 1) append_utf8(out, fold->b);
             if (fold->count > 2) append_utf8(out, fold->c);
         } else {
-            out.append(decoded.substr(i, width));
+            out.append(std::string_view(decoded).substr(i, width));
         }
         i += width;
     }
@@ -164,4 +174,3 @@ std::string clean_url(std::string_view input) { return unescape_entities(input);
 std::string clean_title(std::string_view input) { return unescape_entities(input); }
 
 } // namespace chmd::detail
-

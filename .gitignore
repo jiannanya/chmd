@@ -5,4 +5,5 @@
 *.suo
 *.pdb
 *.ilk
-
+OPTIMIZATION*.md
+benchmarks/results/

@@ -19,6 +19,12 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Install and build a downstream consumer
+        run: |
+          cmake --install build --prefix "${{ github.workspace }}/build/install"
+          cmake -S tests/package -B build/package -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${{ github.workspace }}/build/install"
+          cmake --build build/package --parallel
+          ./build/package/chmd_package_smoke
 
   sanitizers:
     runs-on: ubuntu-latest
@@ -31,3 +37,12 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and smoke-test libFuzzer
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCHMD_BUILD_TESTS=OFF -DCHMD_BUILD_FUZZER=ON
+          cmake --build build --parallel
+          ./build/chmd_fuzzer -runs=10000 -max_len=4096

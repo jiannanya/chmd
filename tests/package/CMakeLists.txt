@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(chmd_package_smoke LANGUAGES CXX)
+find_package(chmd 1.2 CONFIG REQUIRED)
+add_executable(chmd_package_smoke main.cpp)
+target_link_libraries(chmd_package_smoke PRIVATE chmd::chmd)

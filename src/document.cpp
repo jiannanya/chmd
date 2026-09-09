@@ -1,16 +1,25 @@
 #include "internal.hpp"
 
+#include <algorithm>
 #include <new>
 
 namespace chmd {
 
 Document::Document() {
-    nodes_.reserve(64);
     nodes_.emplace_back();
     nodes_.back().type = NodeType::document;
 }
 
-const char* version() noexcept { return "1.1.0"; }
+void Document::shrink_to_fit() {
+    source_.shrink_to_fit();
+    for (auto& node : nodes_) {
+        node.literal.shrink_to_fit();
+        node.title.shrink_to_fit();
+    }
+    nodes_.shrink_to_fit();
+}
+
+const char* version() noexcept { return "1.2.0"; }
 
 std::string_view node_type_name(NodeType type) noexcept {
     using enum NodeType;
@@ -46,6 +55,7 @@ std::string_view node_type_name(NodeType type) noexcept {
 namespace detail {
 
 NodeId Builder::make(NodeType type, SourceRange source) {
+    if (!ok()) return npos;
     if (options_.max_nodes != 0 && nodes_.size() >= options_.max_nodes) {
         error_ = {ErrorCode::node_limit, source.begin, "node limit exceeded"};
         return npos;
@@ -53,6 +63,12 @@ NodeId Builder::make(NodeType type, SourceRange source) {
     if (nodes_.size() >= static_cast<std::size_t>(npos)) {
         error_ = {ErrorCode::node_limit, source.begin, "node index range exhausted"};
         return npos;
+    }
+    if (nodes_.size() == nodes_.capacity()) {
+        auto capacity = std::max<std::size_t>(8, nodes_.capacity() +
+            std::min(nodes_.capacity(), static_cast<std::size_t>(npos) - nodes_.capacity()));
+        if (options_.max_nodes != 0) capacity = std::min(capacity, options_.max_nodes);
+        nodes_.reserve(capacity);
     }
     nodes_.push_back(Node{});
     auto id = static_cast<NodeId>(nodes_.size() - 1);
@@ -129,6 +145,39 @@ void Builder::move_range(NodeId first, NodeId last, NodeId new_parent) {
 
 void Builder::remove_if_empty(NodeId id) {
     if (nodes_[id].literal.empty() && nodes_[id].first_child == npos) unlink(id);
+}
+
+bool Builder::check_nesting(std::size_t depth, std::size_t offset) {
+    if (ok() && options_.max_nesting != 0 && depth >= options_.max_nesting)
+        error_ = {ErrorCode::nesting_limit, offset, "nesting limit exceeded"};
+    return ok();
+}
+
+void Builder::compact(NodeId begin, NodeId parent) {
+    auto first_hole = begin;
+    while (first_hole < nodes_.size() && nodes_[first_hole].parent != npos) ++first_hole;
+    if (first_hole == nodes_.size()) return;
+    remap_.resize(nodes_.size() - begin);
+    auto next = begin;
+    for (auto id = begin; id < nodes_.size(); ++id)
+        remap_[id - begin] = nodes_[id].parent == npos ? npos : next++;
+    const auto map = [&](NodeId id) {
+        return id == npos || id < begin ? id : remap_[id - begin];
+    };
+    nodes_[parent].first_child = map(nodes_[parent].first_child);
+    nodes_[parent].last_child = map(nodes_[parent].last_child);
+    for (auto id = begin; id < nodes_.size(); ++id) {
+        const auto destination = remap_[id - begin];
+        if (destination == npos) continue;
+        auto& node = nodes_[id];
+        node.parent = map(node.parent);
+        node.first_child = map(node.first_child);
+        node.last_child = map(node.last_child);
+        node.previous = map(node.previous);
+        node.next = map(node.next);
+        if (destination != id) nodes_[destination] = std::move(node);
+    }
+    nodes_.resize(next);
 }
 
 bool is_leaf(NodeType type) noexcept {

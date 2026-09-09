@@ -116,6 +116,10 @@ public:
     [[nodiscard]] std::span<const Node> nodes() const noexcept { return nodes_; }
     [[nodiscard]] std::string_view source() const noexcept { return source_; }
     [[nodiscard]] std::size_t size() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::size_t capacity() const noexcept { return nodes_.capacity(); }
+    // Optional memory/CPU tradeoff for documents retained for a long time.
+    // Node indices remain valid; references and spans can be invalidated.
+    void shrink_to_fit();
 
 private:
     std::string source_;
@@ -159,6 +163,10 @@ struct HtmlOptions {
 [[nodiscard]] std::string render_html(const Document& document, HtmlOptions options = {});
 [[nodiscard]] std::string render_ast(const Document& document, bool pretty = true);
 [[nodiscard]] std::string render_events(const Document& document);
+// Replace output while retaining its capacity for repeated rendering.
+void render_html_to(const Document& document, std::string& output, HtmlOptions options = {});
+void render_ast_to(const Document& document, std::string& output, bool pretty = true);
+void render_events_to(const Document& document, std::string& output);
 void walk_events(const Document& document, EventHandler& handler);
 [[nodiscard]] std::string_view node_type_name(NodeType type) noexcept;
 [[nodiscard]] const char* version() noexcept;
