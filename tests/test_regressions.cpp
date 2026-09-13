@@ -72,6 +72,49 @@ int main() {
                "invalid destinations/titles do not define reference links");
     }
 
+    html("&&&&amp; &&&&#65; &&&&", "<p>&amp;&amp;&amp;&amp; &amp;&amp;&amp;A &amp;&amp;&amp;&amp;</p>\n");
+    html("&a **b** &amp;", "<p>&amp;a <strong>b</strong> &amp;</p>\n");
+    html("[a&amp;b]: /url\n\n[a&b] [a&amp;b]", "<p>[a&amp;b] <a href=\"/url\">a&amp;b</a></p>\n");
+    html("[a&amp;b]: /one\n[a&b]: /two\n\n[a&amp;b] [a&b]",
+         "<p><a href=\"/one\">a&amp;b</a> <a href=\"/two\">a&amp;b</a></p>\n");
+    html("# [r]: /url\n\n[r]", "<h1>[r]: /url</h1>\n<p>[r]</p>\n");
+    html("[r]: /one\n\n# [r]: /two\n\n[r]",
+         "<h1><a href=\"/one\">r</a>: /two</h1>\n<p><a href=\"/one\">r</a></p>\n");
+    html("[a\xC2\xA0" "b]: /url\n\n[a b] [a\xC2\xA0" "b]",
+         "<p>[a b] <a href=\"/url\">a\xC2\xA0" "b</a></p>\n");
+    html("[a\\*b]: /url\n\n[a*b] [a\\*b]", "<p>[a*b] <a href=\"/url\">a*b</a></p>\n");
+    html("[x](\\&amp; \"\\&quot;\")", "<p><a href=\"&amp;amp;\" title=\"&amp;quot;\">x</a></p>\n");
+    html("[x]: \\&amp; \"\\&quot;\"\n\n[x]", "<p><a href=\"&amp;amp;\" title=\"&amp;quot;\">x</a></p>\n");
+    html("~~~ \\&amp;\nx\n~~~", "<pre><code class=\"language-&amp;amp;\">x\n</code></pre>\n");
+    html("[x](&#92;&amp;)", "<p><a href=\"%5C&amp;\">x</a></p>\n");
+    html("> [r]: /early\n\n[r]: /late\n\n[r]",
+         "<blockquote>\n</blockquote>\n<p><a href=\"/early\">r</a></p>\n");
+    html("[r]: /early\nheading\n---\n\n[r]: /late\n\n[r]",
+         "<h2>heading</h2>\n<p><a href=\"/early\">r</a></p>\n");
+    html("[r]: /early\n\n> [r]: /late\n\n[r]",
+         "<blockquote>\n</blockquote>\n<p><a href=\"/early\">r</a></p>\n");
+    const auto long_label = repeat("\xE4\xB8\xAD", 999);
+    html("[" + long_label + "]: /url\n\n[x][" + long_label + "]",
+         "<p><a href=\"/url\">x</a></p>\n");
+    html("[" + long_label + "]: /url\n\n![" + long_label + "][]",
+         "<p><img src=\"/url\" alt=\"" + long_label + "\" /></p>\n");
+    const auto too_long = std::string(999, ' ') + "x";
+    html("[x]: /url\n\n[" + too_long + "]", "<p>[" + too_long + "]</p>\n");
+    auto invalid_label = chmd::Parser().parse("[" + long_label + "x]: /url\n\n[x][" + long_label + "x]");
+    expect(invalid_label && chmd::render_html(invalid_label.document).find("<a href=") == std::string::npos,
+           "reference labels reject more than 999 Unicode characters");
+    chmd::ParseOptions definitions_limit;
+    definitions_limit.max_nodes = 2;
+    auto bounded_definitions = chmd::Parser(definitions_limit).parse(repeat("[r]: /url\n\n", 20000));
+    expect(bounded_definitions && bounded_definitions.document.size() == 1 && bounded_definitions.document.capacity() <= 2,
+           "closed root definitions reuse a bounded construction arena");
+
+    html("plain text   ", "<p>plain text</p>\n");
+    html("# plain text\t", "<h1>plain text</h1>\n");
+    html("plain > text", "<p>plain &gt; text</p>\n");
+    auto literal_block = chmd::Parser().parse(std::string(1048576, 'a'));
+    expect(literal_block && literal_block.document.size() == 3, "long literal block contains one text node");
+    if (literal_block) validate(literal_block.document);
     auto blank = chmd::Parser().parse(std::string(1024 * 1024, '\n'));
     expect(blank && blank.document.size() == 1 && blank.document.capacity() <= 64, "blank lines do not reserve an input-sized node arena");
     auto definitions = chmd::Parser().parse(repeat("[ref]: /url\n\n", 20000));

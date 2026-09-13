@@ -30,6 +30,7 @@ constexpr bool ascii_alnum(unsigned char c) noexcept {
 struct Reference {
     std::string destination;
     std::string title;
+    std::uint32_t source_offset = 0;
 };
 
 using ReferenceMap = std::unordered_map<std::string, Reference>;
@@ -65,9 +66,14 @@ private:
 bool valid_utf8(std::string_view input, std::size_t& bad_offset) noexcept;
 void normalize_input(std::string_view input, std::string& output);
 std::string normalize_reference(std::string_view label);
-std::string unescape_entities(std::string_view input);
-std::string clean_url(std::string_view input);
-std::string clean_title(std::string_view input);
+struct LinkLabel {
+    std::string_view text;
+    std::size_t end = 0;
+};
+LinkLabel scan_link_label(std::string_view input, std::size_t begin);
+// Append exactly one entity at the start of input; return bytes consumed.
+std::size_t append_entity(std::string_view input, std::string& output);
+std::string unescape_markdown(std::string_view input);
 bool is_unicode_whitespace(std::uint32_t cp) noexcept;
 bool is_unicode_punctuation(std::uint32_t cp) noexcept;
 std::uint32_t decode_utf8_before(std::string_view text, std::size_t offset) noexcept;

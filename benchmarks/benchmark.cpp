@@ -69,11 +69,20 @@ void measure(std::string_view name, const std::string& input, int rounds, chmd::
     for (int round = 0; round < rounds; ++round)
         checksum += chmd::render_html(parsed.document).size();
     const double render_seconds = seconds(render_start);
+    const auto ast_start = Clock::now();
+    for (int round = 0; round < rounds; ++round)
+        checksum += chmd::render_ast(parsed.document, false).size();
+    const double ast_seconds = seconds(ast_start);
+    const auto events_start = Clock::now();
+    for (int round = 0; round < rounds; ++round)
+        checksum += chmd::render_events(parsed.document).size();
+    const double events_seconds = seconds(events_start);
     std::cout << name << ',' << input.size() << ',' << rounds << ','
               << std::fixed << std::setprecision(6) << parse_seconds << ','
               << (input.size() / 1048576.0 * rounds / parse_seconds) << ','
               << render_seconds << ',' << parsed.document.size() << ','
-              << retained << ',' << peak << ',' << allocations << ',' << checksum << std::endl;
+              << retained << ',' << peak << ',' << allocations << ',' << checksum << ','
+              << ast_seconds << ',' << events_seconds << std::endl;
 }
 }
 int main(int argc, char** argv) {
@@ -85,7 +94,7 @@ int main(int argc, char** argv) {
         if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || rounds <= 0) return 2;
     }
     constexpr std::size_t mib = 1024 * 1024;
-    std::cout << "case,input_bytes,rounds,parse_seconds,parse_mib_s,html_seconds,nodes,retained_bytes,peak_bytes,allocations,checksum\n";
+    std::cout << "case,input_bytes,rounds,parse_seconds,parse_mib_s,html_seconds,nodes,retained_bytes,peak_bytes,allocations,checksum,ast_seconds,events_seconds\n";
     measure("mixed", repeated("## Heading\n\n- [link](https://example.com) and **strong** text\n- `code` &amp; text\n\n", mib), rounds);
     measure("plain", repeated("Ordinary prose with no markup and a short line.\n", mib), rounds);
     measure("blank_lines", std::string(mib, '\n'), rounds);
@@ -100,6 +109,15 @@ int main(int argc, char** argv) {
     measure("reference_definitions", repeated("[ref]: /url\n\n", mib), rounds);
     measure("text_fragments", repeated("] text ", 65536), rounds);
     measure("large_table_header", "| " + std::string(mib, 'a') + " |\n| - |\n", rounds);
+    std::string unique_references;
+    for (int i = 0; i < 10000; ++i)
+        unique_references += "[ref" + std::to_string(i) + "]: /url\n\n";
+    measure("unique_references", unique_references, rounds);
+    measure("entities", repeated("&amp; &lt; &#169; &NotEqualTilde; ", mib), rounds);
+    measure("plain_long", std::string(mib, 'a'), rounds);
+    measure("code_block", "```text\n" + repeated("plain code content ", mib) + "\n```\n", rounds);
+    measure("excess_table_cells", "| a | b |\n| - | - |\n| c | d |" + repeated(" tail |", mib) + "\n", rounds);
+    measure("unicode", repeated("\xE4\xB8\xAD\xE6\x96\x87\xE6\xAE\xB5\xE8\x90\xBD\xE4\xB8\x8E\x20\x55\x6E\x69\x63\x6F\x64\x65\x20\xE7\xAC\xA6\xE5\x8F\xB7\x20\xF0\x9F\x98\x80\xE3\x80\x82", mib), rounds);
     chmd::ParseOptions unlimited;
     unlimited.max_nesting = 0;
     measure("nested_images", repeated("![", 24000) + "x" + repeated("](u)", 48000), rounds, unlimited);

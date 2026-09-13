@@ -94,58 +94,82 @@ bool is_unicode_punctuation(std::uint32_t cp) noexcept {
     return cp < 0x80U ? ascii_punctuation(cp) : in_ranges(cp, punctuation_ranges);
 }
 
-std::string unescape_entities(std::string_view input) {
-    if (input.find('&') == std::string_view::npos) return std::string(input);
-    std::string out;
-    out.reserve(input.size());
-    for (std::size_t i = 0; i < input.size();) {
-        if (input[i] != '&') {
-            out.push_back(input[i++]);
-            continue;
-        }
-        const auto relative = input.substr(i + 1, 33).find(';');
-        if (relative == std::string_view::npos) {
-            out.push_back(input[i++]);
-            continue;
-        }
-        const auto semicolon = i + 1 + relative;
-        const auto body = input.substr(i + 1, semicolon - i - 1);
-        if (body.starts_with('#')) {
-            const bool hex = body.size() >= 2 && (body[1] == 'x' || body[1] == 'X');
-            const auto digits = body.substr(hex ? 2 : 1);
-            if ((!hex && digits.size() > 7) || (hex && digits.size() > 6)) {
-                out.push_back(input[i++]);
-                continue;
-            }
-            bool valid = false;
-            const auto value = parse_numeric(digits, hex ? 16U : 10U, valid);
-            if (!valid) { out.push_back(input[i++]); continue; }
-            append_utf8(out, value);
-            i = semicolon + 1;
-            continue;
-        }
+std::size_t append_entity(std::string_view input, std::string& output) {
+    if (input.size() < 3 || input.front() != '&') return 0;
+    const auto relative = input.substr(1, 33).find(';');
+    if (relative == std::string_view::npos) return 0;
+    const auto body = input.substr(1, relative);
+    if (body.starts_with('#')) {
+        const bool hex = body.size() >= 2 && (body[1] == 'x' || body[1] == 'X');
+        const auto digits = body.substr(hex ? 2 : 1);
+        if (digits.size() > (hex ? 6U : 7U)) return 0;
+        bool valid = false;
+        const auto value = parse_numeric(digits, hex ? 16U : 10U, valid);
+        if (!valid) return 0;
+        append_utf8(output, value);
+    } else {
         const auto* entity = std::lower_bound(std::begin(html_entities), std::end(html_entities), body,
             [](const Entity& item, std::string_view name) { return item.name < name; });
-        if (entity == std::end(html_entities) || entity->name != body) {
-            out.push_back(input[i++]);
-            continue;
-        }
-        append_utf8(out, entity->a);
-        if (entity->count == 2) append_utf8(out, entity->b);
-        i = semicolon + 1;
+        if (entity == std::end(html_entities) || entity->name != body) return 0;
+        append_utf8(output, entity->a);
+        if (entity->count == 2) append_utf8(output, entity->b);
     }
+    return relative + 2;
+}
+
+std::string unescape_markdown(std::string_view input) {
+    constexpr std::string_view specials = "\\&";
+    auto special = input.find_first_of(specials);
+    if (special == std::string_view::npos) return std::string(input);
+    std::string out;
+    out.reserve(input.size());
+    std::size_t begin = 0;
+    do {
+        out.append(input.substr(begin, special - begin));
+        begin = special;
+        if (input[begin] == '\\' && begin + 1 < input.size() &&
+            ascii_punctuation(static_cast<unsigned char>(input[begin + 1]))) {
+            out.push_back(input[begin + 1]);
+            begin += 2;
+        } else if (const auto consumed = append_entity(input.substr(begin), out)) {
+            begin += consumed;
+        } else {
+            out.push_back(input[begin++]);
+        }
+        special = input.find_first_of(specials, begin);
+    } while (special != std::string_view::npos);
+    out.append(input.substr(begin));
     return out;
 }
 
-std::string normalize_reference(std::string_view label) {
-    auto decoded = unescape_entities(label);
-    std::string out;
-    out.reserve(decoded.size());
-    bool pending_space = false;
-    for (std::size_t i = 0; i < decoded.size();) {
+LinkLabel scan_link_label(std::string_view input, std::size_t begin) {
+    if (begin >= input.size() || input[begin] != '[') return {};
+    std::size_t characters = 0;
+    bool escaped = false;
+    bool nonspace = false;
+    for (auto pos = begin + 1; pos < input.size();) {
+        const auto c = input[pos];
+        if (!escaped && c == ']')
+            return nonspace ? LinkLabel{input.substr(begin + 1, pos - begin - 1), pos + 1} : LinkLabel{};
+        if (!escaped && c == '[') return {};
+        if (++characters > 999) return {};
+        nonspace = nonspace || (c != ' ' && c != '\t' && c != '\n' && c != '\r');
+        escaped = !escaped && c == '\\';
         std::size_t width = 1;
-        const auto cp = decode_utf8_at(decoded, i, &width);
-        if (is_unicode_whitespace(cp)) {
+        if (static_cast<unsigned char>(c) >= 0x80U) decode_utf8_at(input, pos, &width);
+        pos += width;
+    }
+    return {};
+}
+
+std::string normalize_reference(std::string_view label) {
+    std::string out;
+    out.reserve(label.size());
+    bool pending_space = false;
+    for (std::size_t i = 0; i < label.size();) {
+        std::size_t width = 1;
+        const auto cp = decode_utf8_at(label, i, &width);
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') {
             if (!out.empty()) pending_space = true;
             i += width;
             continue;
@@ -163,14 +187,11 @@ std::string normalize_reference(std::string_view label) {
             if (fold->count > 1) append_utf8(out, fold->b);
             if (fold->count > 2) append_utf8(out, fold->c);
         } else {
-            out.append(std::string_view(decoded).substr(i, width));
+            out.append(label.substr(i, width));
         }
         i += width;
     }
     return out;
 }
-
-std::string clean_url(std::string_view input) { return unescape_entities(input); }
-std::string clean_title(std::string_view input) { return unescape_entities(input); }
 
 } // namespace chmd::detail

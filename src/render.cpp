@@ -26,12 +26,20 @@ void append_escaped(std::string& out, std::string_view text, bool attribute = fa
 void append_json_string(std::string& out, std::string_view text) {
     out.push_back('"');
     static constexpr char hex[] = "0123456789abcdef";
-    for (std::size_t i = 0; i < text.size(); ++i) {
-        const auto c = static_cast<unsigned char>(text[i]);
+    for (std::size_t i = 0; i < text.size();) {
+        const auto begin = i;
+        while (i < text.size()) {
+            const auto byte = static_cast<unsigned char>(text[i]);
+            if (byte < 0x20U || byte >= 0x80U || byte == '"' || byte == '\\') break;
+            ++i;
+        }
+        out.append(text.substr(begin, i - begin));
+        if (i == text.size()) break;
+        const auto c = static_cast<unsigned char>(text[i++]);
         if (c >= 0x80U) {
             const std::size_t width = c >= 0xC2U && c <= 0xDFU ? 2 :
                 (c >= 0xE0U && c <= 0xEFU ? 3 : (c >= 0xF0U && c <= 0xF4U ? 4 : 1));
-            const auto sequence = text.substr(i, width);
+            const auto sequence = text.substr(i - 1, width);
             std::size_t bad = 0;
             if (sequence.size() == width && detail::valid_utf8(sequence, bad)) {
                 out.append(sequence);
@@ -62,14 +70,21 @@ void append_json_string(std::string& out, std::string_view text) {
 
 void append_url(std::string& out, std::string_view url) {
     static constexpr char hex[] = "0123456789ABCDEF";
-    for (const char raw : url) {
-        const auto c = static_cast<unsigned char>(raw);
-        const bool safe = detail::ascii_alnum(c) || c == '-' || c == '.' || c == '_' || c == '~' ||
-            c == ':' || c == '/' || c == '?' || c == '#' || c == '@' ||
-            c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
-            c == '+' || c == ',' || c == ';' || c == '=' || c == '%';
+    static constexpr auto safe = [] {
+        std::array<bool, 256> table{};
+        constexpr std::string_view punctuation = "-._~:/?#@!$'()*+,;=%";
+        for (unsigned c = 0; c < 128; ++c)
+            table[c] = detail::ascii_alnum(static_cast<unsigned char>(c)) ||
+                punctuation.find(static_cast<char>(c)) != std::string_view::npos;
+        return table;
+    }();
+    for (std::size_t pos = 0; pos < url.size();) {
+        const auto begin = pos;
+        while (pos < url.size() && safe[static_cast<unsigned char>(url[pos])]) ++pos;
+        out.append(url.substr(begin, pos - begin));
+        if (pos == url.size()) break;
+        const auto c = static_cast<unsigned char>(url[pos++]);
         if (c == '&') out += "&amp;";
-        else if (safe && c < 0x80U) out.push_back(static_cast<char>(c));
         else {
             out.push_back('%');
             out.push_back(hex[c >> 4U]);

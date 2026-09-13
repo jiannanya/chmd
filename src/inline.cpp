@@ -20,21 +20,6 @@ bool ascii_control_or_space(char c) noexcept {
     return value <= 0x20U || value == 0x7FU;
 }
 
-std::string unescape_markdown(std::string_view input) {
-    if (input.find_first_of("\\&") == std::string_view::npos) return std::string(input);
-    std::string out;
-    out.reserve(input.size());
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        if (input[i] == '\\' && i + 1 < input.size() && escapable(input[i + 1])) ++i;
-        out.push_back(input[i]);
-    }
-    return unescape_entities(out);
-}
-
-std::string normalized_label(std::string_view input) {
-    return normalize_reference(input);
-}
-
 struct LinkTail {
     bool valid = false;
     std::size_t end = 0;
@@ -343,6 +328,9 @@ public:
             })) coalesce_text(first_inline);
             builder_.compact(first_inline, parent_);
         }
+        // Input ownership comes from the block; its capacity is never reused
+        // when the next block is moved in, so retire it before other blocks.
+        std::string{}.swap(input_);
     }
 
 private:
@@ -478,19 +466,18 @@ private:
     }
 
     void parse_entity() {
-        const auto relative = std::string_view(input_).substr(pos_ + 1, 33).find(';');
-        if (relative != std::string_view::npos) {
-            const auto semicolon = pos_ + 1 + relative;
-            const auto raw = std::string_view(input_).substr(pos_, semicolon - pos_ + 1);
-            auto decoded = unescape_entities(raw);
-            if (decoded != raw) {
-                append_node(NodeType::text, decoded, pos_, semicolon + 1);
-                pos_ = semicolon + 1;
-                return;
-            }
+        std::string decoded;
+        if (const auto consumed = append_entity(std::string_view(input_).substr(pos_), decoded)) {
+            append_node(NodeType::text, decoded, pos_, pos_ + consumed);
+            pos_ += consumed;
+            return;
         }
-        append_node(NodeType::text, "&", pos_, pos_ + 1);
-        ++pos_;
+        const auto begin = pos_++;
+        while (pos_ < input_.size() && input_[pos_] == '&') ++pos_;
+        // Keep the last marker only when it could introduce an entity.
+        if (pos_ - begin > 1 && pos_ < input_.size() &&
+            (input_[pos_] == '#' || ascii_alpha(static_cast<unsigned char>(input_[pos_])))) --pos_;
+        append_node(NodeType::text, std::string_view(input_).substr(begin, pos_ - begin), begin, pos_);
     }
 
     void parse_less_than() {
@@ -652,25 +639,23 @@ private:
         if (!tail.valid && !references_.empty()) {
             std::string_view label;
             std::size_t reference_end = pos_;
+            const auto shortcut_label = [&] {
+                const auto parsed = scan_link_label(input_, opener.source_pos + (opener.image ? 1 : 0));
+                return parsed.end == close_pos + 1 ? parsed.text : std::string_view{};
+            };
             if (pos_ < input_.size() && input_[pos_] == '[') {
-                auto end = pos_ + 1;
-                bool escaped = false;
-                while (end < input_.size() && end - pos_ <= 1001) {
-                    if (!escaped && input_[end] == ']') break;
-                    escaped = !escaped && input_[end] == '\\';
-                    if (input_[end] != '\\') escaped = false;
-                    ++end;
-                }
-                if (end < input_.size() && input_[end] == ']') {
-                    label = std::string_view(input_).substr(pos_ + 1, end - pos_ - 1);
-                    reference_end = end + 1;
-                    if (label.empty()) label = std::string_view(input_).substr(opener.source_pos + (opener.image ? 2 : 1), close_pos - opener.source_pos - (opener.image ? 2 : 1));
+                if (pos_ + 1 < input_.size() && input_[pos_ + 1] == ']') {
+                    reference_end = pos_ + 2;
+                    label = shortcut_label();
+                } else if (const auto parsed = scan_link_label(input_, pos_); parsed.end != 0) {
+                    label = parsed.text;
+                    reference_end = parsed.end;
                 }
             } else {
-                label = std::string_view(input_).substr(opener.source_pos + (opener.image ? 2 : 1), close_pos - opener.source_pos - (opener.image ? 2 : 1));
+                label = shortcut_label();
             }
-            if (label.size() <= 999) {
-                const auto found = references_.find(normalized_label(label));
+            if (!label.empty() && label.size() <= 999 * 4) {
+                const auto found = references_.find(normalize_reference(label));
                 if (found != references_.end()) {
                     tail.valid = true;
                     tail.end = reference_end;
@@ -878,7 +863,21 @@ void parse_inlines(Builder& builder, const ReferenceMap& references,
         if ((type == NodeType::paragraph || type == NodeType::heading || type == NodeType::table_cell) &&
             builder.get(id).parent != npos) {
             auto literal = std::move(builder.get(id).literal);
-            parser.run(id, std::move(literal));
+            const auto specials = options.extensions.strikethrough ? "\\`&<\n*_[]!~" : "\\`&<\n*_[]!";
+            if (literal.find_first_of(specials) == std::string::npos) {
+                // A literal-only block needs one text node and no parser
+                // scratch state. Transfer ownership instead of copying it.
+                const auto begin = builder.get(id).source.begin;
+                const auto end = static_cast<std::uint32_t>(std::min<std::size_t>(
+                    static_cast<std::size_t>(begin) + literal.size(), std::numeric_limits<std::uint32_t>::max()));
+                while (!literal.empty() && (literal.back() == ' ' || literal.back() == '\t')) literal.pop_back();
+                if (!literal.empty()) {
+                    const auto text = builder.append(id, NodeType::text, {begin, end});
+                    if (text != npos) builder.get(text).literal = std::move(literal);
+                }
+            } else {
+                parser.run(id, std::move(literal));
+            }
         }
     }
 }

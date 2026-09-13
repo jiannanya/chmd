@@ -39,4 +39,7 @@ for markdown in [b"", b"**x**", b"![a *b*](u) after", b"- [x] done\n\n| a |\n| -
     assert json.loads(pretty) == json.loads(compact)
     assert b"\n" not in compact
     assert run(["--to", "events"], markdown).stdout.startswith(b"enter document\n")
+body = (b'plain text "quotes" \\slashes ' * 4000) + "中文 😀".encode() + b" bad \xff\n"
+ast = json.loads(run(["--to", "ast", "--compact"], b"~~~\n" + body + b"~~~").stdout)
+assert ast["children"][0]["literal"] == body.decode("utf-8", errors="replace")
 print("CLI regression checks passed")

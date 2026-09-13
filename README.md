@@ -129,7 +129,7 @@ cmake --build build-bench --parallel
 ./build-bench/chmd_benchmark
 ```
 
-The benchmark covers 16 workloads and defaults to 10 rounds per case; pass a positive integer as its first argument to change the round count. CSV output includes separate parsing and HTML timings, node counts, and requested heap allocation statistics. Heap counters exclude caller input, allocator metadata, and stack; they are not process RSS.
+The benchmark covers 22 workloads and defaults to 10 rounds per case; pass a positive integer as its first argument to change the round count. CSV output includes separate parsing, HTML, compact AST, and event timings, node counts, and requested heap allocation statistics. Heap counters exclude caller input, allocator metadata, and stack; they are not process RSS.
 
 ## Tests and specification fixture
 

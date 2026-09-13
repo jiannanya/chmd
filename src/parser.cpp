@@ -420,14 +420,15 @@ const TableRowParse& split_table_row(std::string_view row, TableRowParse& result
         result.has_pipe = true;
         cell_begin = begin + 1;
     }
-    for (std::size_t i = cell_begin; i < end; ++i) {
-        if (row[i] != '|' || escaped_pipe(row, i)) continue;
+    for (auto i = row.find('|', cell_begin); i < end; i = row.find('|', i + 1)) {
+        if (escaped_pipe(row, i)) continue;
         result.has_pipe = true;
         auto first = cell_begin;
         auto last = i;
         while (first < last && ascii_space(row[first])) ++first;
         while (last > first && ascii_space(row[last - 1])) --last;
         if (result.cells.size() < max_cells) result.cells.push_back({first, last});
+        if (result.cells.size() == max_cells) return result;
         cell_begin = i + 1;
     }
     if (cell_begin < end || row[end - 1] != '|') {
@@ -441,17 +442,26 @@ const TableRowParse& split_table_row(std::string_view row, TableRowParse& result
 }
 
 std::string table_cell_text(std::string_view row, TableCellSlice cell) {
+    const auto text = row.substr(cell.begin, cell.end - cell.begin);
+    auto escaped = text.find("\\|");
+    if (escaped == std::string_view::npos) return std::string(text);
     std::string result;
-    result.reserve(cell.end - cell.begin);
-    for (auto i = cell.begin; i < cell.end; ++i) {
-        if (row[i] == '\\' && i + 1 < cell.end && row[i + 1] == '|') continue;
-        result.push_back(row[i]);
-    }
+    result.reserve(text.size());
+    std::size_t begin = 0;
+    do {
+        result.append(text.substr(begin, escaped - begin));
+        begin = escaped + 1;
+        escaped = text.find("\\|", begin);
+    } while (escaped != std::string_view::npos);
+    result.append(text.substr(begin));
     return result;
 }
 
 bool parse_table_delimiter(std::string_view row,
                            std::vector<TableAlignment>& alignments, TableRowParse& scratch) {
+    const auto first = row.find_first_not_of(" \t");
+    if (first == std::string_view::npos || (row[first] != '|' && row[first] != '-' && row[first] != ':'))
+        return false;
     const auto& parsed = split_table_row(row, scratch);
     if (!parsed.has_pipe || parsed.cells.empty()) return false;
     alignments.clear();
@@ -486,45 +496,13 @@ struct ReferenceParse {
     Reference reference;
 };
 
-bool escapable(char c) noexcept {
-    return (c >= '!' && c <= '/') || (c >= ':' && c <= '@') ||
-           (c >= '[' && c <= '`') || (c >= '{' && c <= '~');
-}
-
-std::string unescape_backslashes(std::string_view value) {
-    std::string out;
-    out.reserve(value.size());
-    for (std::size_t i = 0; i < value.size(); ++i) {
-        if (value[i] == '\\' && i + 1 < value.size() && escapable(value[i + 1])) ++i;
-        out.push_back(value[i]);
-    }
-    return unescape_entities(out);
-}
-
 ReferenceParse parse_reference(std::string_view text) {
     ReferenceParse result;
     if (text.empty() || text[0] != '[') return result;
-    std::size_t i = 1;
-    std::string raw_label;
-    raw_label.reserve(32);
-    bool nonspace = false;
-    while (i < text.size() && raw_label.size() <= 999) {
-        if (text[i] == '\n' && i + 1 < text.size() && text[i + 1] == '\n') return {};
-        if (text[i] == '\\' && i + 1 < text.size() && escapable(text[i + 1])) {
-            raw_label.push_back('\\');
-            raw_label.push_back(text[i + 1]);
-            if (!ascii_space(text[i + 1]) && text[i + 1] != '\n') nonspace = true;
-            i += 2;
-            continue;
-        }
-        if (text[i] == '[') return {};
-        if (text[i] == ']') break;
-        raw_label.push_back(text[i]);
-        if (!ascii_space(text[i]) && text[i] != '\n') nonspace = true;
-        ++i;
-    }
-    if (i >= text.size() || text[i] != ']' || !nonspace || raw_label.size() > 999) return {};
-    ++i;
+    const auto parsed_label = scan_link_label(text, 0);
+    if (parsed_label.end == 0) return result;
+    const auto raw_label = parsed_label.text;
+    auto i = parsed_label.end;
     if (i >= text.size() || text[i++] != ':') return {};
     while (i < text.size() && ascii_space(text[i])) ++i;
     if (i < text.size() && text[i] == '\n') {
@@ -545,7 +523,7 @@ ReferenceParse parse_reference(std::string_view text) {
             ++i;
         }
         if (i >= text.size() || text[i] != '>') return {};
-        destination = unescape_backslashes(text.substr(begin, i - begin));
+        destination = unescape_markdown(text.substr(begin, i - begin));
         ++i;
     } else {
         const auto begin = i;
@@ -561,7 +539,7 @@ ReferenceParse parse_reference(std::string_view text) {
             ++i;
         }
         if (i == begin || depth != 0) return {};
-        destination = unescape_backslashes(text.substr(begin, i - begin));
+        destination = unescape_markdown(text.substr(begin, i - begin));
     }
 
     const auto after_destination = i;
@@ -587,7 +565,7 @@ ReferenceParse parse_reference(std::string_view text) {
             ++i;
         }
         if (i < text.size() && text[i] == closer) {
-            title = unescape_backslashes(text.substr(begin, i - begin));
+            title = unescape_markdown(text.substr(begin, i - begin));
             ++i;
             parsed_title = true;
         } else {
@@ -648,6 +626,20 @@ private:
                 while (node.literal.ends_with("\n\n")) node.literal.pop_back();
             }
             open_.pop_back();
+            // A closed root paragraph cannot influence list tightness or
+            // become a setext heading. Release definition-only tail nodes
+            // before the next paragraph grows the construction arena.
+            if (node.type == NodeType::paragraph && node.parent == 0 &&
+                !node.literal.empty() && node.literal.front() == '[') {
+                const auto consumed = collect_references(node);
+                if (consumed != 0) {
+                    node.literal.erase(0, consumed);
+                    if (node.literal.empty()) {
+                        builder_.unlink(id);
+                        if (id + 1 == builder_.nodes().size()) builder_.nodes().pop_back();
+                    }
+                }
+            }
         }
     }
 
@@ -989,7 +981,7 @@ private:
             node.number = static_cast<std::uint32_t>(fence_count);
             node.marker_offset = static_cast<std::uint16_t>(fence_indent);
             const auto info_end = trim_line_end(line, line.size());
-            if (info_begin < info_end) node.title = unescape_backslashes(line.substr(info_begin, info_end - info_begin));
+            if (info_begin < info_end) node.title = unescape_markdown(line.substr(info_begin, info_end - info_begin));
             push_open(id, info.begin + ind.first);
             touch_open(info.next);
             return;
@@ -1177,19 +1169,30 @@ private:
         }
     }
 
+    std::size_t collect_references(const Node& node) {
+        std::size_t consumed = 0;
+        for (;;) {
+            auto parsed = parse_reference(std::string_view(node.literal).substr(consumed));
+            if (parsed.consumed == 0 || parsed.label.empty()) break;
+            parsed.reference.source_offset = static_cast<std::uint32_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(node.source.begin) + consumed, node.source.end));
+            const auto [found, inserted] = references_.try_emplace(std::move(parsed.label), std::move(parsed.reference));
+            // Nested containers and setext headings are collected later;
+            // document order, not collection order, determines precedence.
+            if (!inserted && parsed.reference.source_offset < found->second.source_offset)
+                found->second = std::move(parsed.reference);
+            consumed += parsed.consumed;
+        }
+        return consumed;
+    }
+
     void extract_references() {
         for (NodeId id = 1; id < builder_.nodes().size(); ++id) {
             auto& node = builder_.get(id);
-            if ((node.type != NodeType::paragraph && node.type != NodeType::heading) || node.parent == npos) continue;
+            if ((node.type != NodeType::paragraph && (node.type != NodeType::heading || node.title.empty())) || node.parent == npos) continue;
             const bool was_heading = node.type == NodeType::heading;
             std::string underline = was_heading ? node.title : std::string{};
-            std::size_t consumed = 0;
-            for (;;) {
-                auto parsed = parse_reference(std::string_view(node.literal).substr(consumed));
-                if (parsed.consumed == 0 || parsed.label.empty()) break;
-                references_.try_emplace(std::move(parsed.label), std::move(parsed.reference));
-                consumed += parsed.consumed;
-            }
+            const auto consumed = collect_references(node);
             if (consumed == 0) continue;
             if (consumed >= node.literal.size()) {
                 if (was_heading) {
