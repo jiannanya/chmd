@@ -179,6 +179,14 @@ int main() {
     options.max_nesting = 5;
     expect(static_cast<bool>(chmd::Parser(options).parse("> *x*")), "inline depth includes containing block quote");
     expect(!chmd::Parser(options).parse("> > *x*"), "inline depth respects outer containers");
+    // Tables create head, row, and cell levels below the line they open on;
+    // the depth limit must reject them while they are being built.
+    auto deep_table = chmd::Parser(options).parse("> > | a |\n> > | - |\n");
+    expect(!deep_table && deep_table.error.code == chmd::ErrorCode::nesting_limit,
+           "table construction respects the nesting limit");
+    options.max_nesting = 8;
+    expect(static_cast<bool>(chmd::Parser(options).parse("> > | a |\n> > | - |\n")),
+           "shallow tables stay within the nesting budget");
 
     // Wall-clock thresholds are deliberately generous under debug/sanitizers.
     const auto start = std::chrono::steady_clock::now();

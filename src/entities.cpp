@@ -7,16 +7,44 @@ namespace {
 
 #include "generated_tables.inc"
 
+constexpr std::size_t entity_count = sizeof(html_entities) / sizeof(html_entities[0]);
+
+// Looking a name up in 2,125 entries costs about eleven string comparisons,
+// each ending in a memcmp call. Packing the first four bytes into an integer
+// turns the search into plain integer compares and leaves one confirmation
+// step for the few entries that share a prefix.
+constexpr std::uint32_t pack_name_prefix(std::string_view name) noexcept {
+    std::uint32_t key = 0;
+    for (std::size_t i = 0; i < 4; ++i)
+        key = (key << 8U) | (i < name.size()
+            ? static_cast<std::uint32_t>(static_cast<unsigned char>(name[i])) : 0U);
+    return key;
+}
+
+// Packing is order-preserving here: entity names are ASCII without NUL, so
+// zero padding sorts a shorter name before any longer one it prefixes.
+constexpr auto entity_prefixes = [] {
+    std::array<std::uint32_t, entity_count> keys{};
+    for (std::size_t i = 0; i < entity_count; ++i) keys[i] = pack_name_prefix(html_entities[i].name);
+    return keys;
+}();
+
+const Entity* find_entity(std::string_view name) noexcept {
+    const auto key = pack_name_prefix(name);
+    const auto* first = std::lower_bound(std::begin(entity_prefixes), std::end(entity_prefixes), key);
+    auto index = static_cast<std::size_t>(first - std::begin(entity_prefixes));
+    while (index < entity_count && entity_prefixes[index] == key) {
+        if (html_entities[index].name == name) return &html_entities[index];
+        ++index;
+    }
+    return nullptr;
+}
+
 template <std::size_t N>
 bool in_ranges(std::uint32_t cp, const Range (&table)[N]) noexcept {
     const auto* found = std::lower_bound(std::begin(table), std::end(table), cp,
         [](const Range& range, std::uint32_t value) { return range.last < value; });
     return found != std::end(table) && cp >= found->first;
-}
-
-bool ascii_punctuation(std::uint32_t cp) noexcept {
-    return (cp >= 0x21U && cp <= 0x2FU) || (cp >= 0x3AU && cp <= 0x40U) ||
-           (cp >= 0x5BU && cp <= 0x60U) || (cp >= 0x7BU && cp <= 0x7EU);
 }
 
 std::uint32_t parse_numeric(std::string_view digits, unsigned base, bool& valid) {
@@ -38,83 +66,76 @@ std::uint32_t parse_numeric(std::string_view digits, unsigned base, bool& valid)
 
 } // namespace
 
-void append_utf8(std::string& out, std::uint32_t cp) {
+namespace {
+char* write_utf8(char* out, std::uint32_t cp) noexcept {
     if (cp <= 0x7FU) {
-        out.push_back(static_cast<char>(cp));
+        *out++ = static_cast<char>(cp);
     } else if (cp <= 0x7FFU) {
-        out.push_back(static_cast<char>(0xC0U | (cp >> 6U)));
-        out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        *out++ = static_cast<char>(0xC0U | (cp >> 6U));
+        *out++ = static_cast<char>(0x80U | (cp & 0x3FU));
     } else if (cp <= 0xFFFFU) {
-        out.push_back(static_cast<char>(0xE0U | (cp >> 12U)));
-        out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
-        out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        *out++ = static_cast<char>(0xE0U | (cp >> 12U));
+        *out++ = static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU));
+        *out++ = static_cast<char>(0x80U | (cp & 0x3FU));
     } else {
-        out.push_back(static_cast<char>(0xF0U | (cp >> 18U)));
-        out.push_back(static_cast<char>(0x80U | ((cp >> 12U) & 0x3FU)));
-        out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
-        out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        *out++ = static_cast<char>(0xF0U | (cp >> 18U));
+        *out++ = static_cast<char>(0x80U | ((cp >> 12U) & 0x3FU));
+        *out++ = static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU));
+        *out++ = static_cast<char>(0x80U | (cp & 0x3FU));
     }
+    return out;
+}
+} // namespace
+
+void append_utf8(std::string& out, std::uint32_t cp) {
+    char buffer[4];
+    out.append(buffer, static_cast<std::size_t>(write_utf8(buffer, cp) - buffer));
 }
 
-std::uint32_t decode_utf8_at(std::string_view text, std::size_t offset, std::size_t* width) noexcept {
-    if (offset >= text.size()) { if (width) *width = 0; return 0; }
-    const auto c = static_cast<unsigned char>(text[offset]);
-    std::size_t count = 1;
-    std::uint32_t value = c;
-    if ((c & 0xE0U) == 0xC0U) { count = 2; value = c & 0x1FU; }
-    else if ((c & 0xF0U) == 0xE0U) { count = 3; value = c & 0x0FU; }
-    else if ((c & 0xF8U) == 0xF0U) { count = 4; value = c & 0x07U; }
-    if (offset + count > text.size()) { if (width) *width = 1; return c; }
-    for (std::size_t i = 1; i < count; ++i) {
-        const auto next = static_cast<unsigned char>(text[offset + i]);
-        if ((next & 0xC0U) != 0x80U) { if (width) *width = 1; return c; }
-        value = (value << 6U) | (next & 0x3FU);
-    }
-    if (width) *width = count;
-    return value;
+std::uint32_t in_unicode_whitespace_ranges(std::uint32_t cp) noexcept {
+    return in_ranges(cp, whitespace_ranges) ? 1U : 0U;
 }
 
-std::uint32_t decode_utf8_before(std::string_view text, std::size_t offset) noexcept {
-    if (offset == 0 || offset > text.size()) return 0;
-    auto begin = offset - 1;
-    std::size_t continuation = 0;
-    while (begin > 0 && (static_cast<unsigned char>(text[begin]) & 0xC0U) == 0x80U && continuation < 3) {
-        --begin;
-        ++continuation;
-    }
-    return decode_utf8_at(text, begin);
+std::uint32_t in_unicode_punctuation_ranges(std::uint32_t cp) noexcept {
+    return in_ranges(cp, punctuation_ranges) ? 1U : 0U;
 }
 
-bool is_unicode_whitespace(std::uint32_t cp) noexcept {
-    if (cp < 0x80U) return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\f' || cp == '\r';
-    return in_ranges(cp, whitespace_ranges);
-}
-
-bool is_unicode_punctuation(std::uint32_t cp) noexcept {
-    return cp < 0x80U ? ascii_punctuation(cp) : in_ranges(cp, punctuation_ranges);
-}
-
-std::size_t append_entity(std::string_view input, std::string& output) {
+std::size_t append_entity(std::string_view input, char* out, std::size_t& written) {
+    written = 0;
     if (input.size() < 3 || input.front() != '&') return 0;
     const auto relative = input.substr(1, 33).find(';');
     if (relative == std::string_view::npos) return 0;
     const auto body = input.substr(1, relative);
+    std::uint32_t value = 0;
+    unsigned count = 1;
+    std::uint32_t second = 0;
     if (body.starts_with('#')) {
         const bool hex = body.size() >= 2 && (body[1] == 'x' || body[1] == 'X');
         const auto digits = body.substr(hex ? 2 : 1);
         if (digits.size() > (hex ? 6U : 7U)) return 0;
         bool valid = false;
-        const auto value = parse_numeric(digits, hex ? 16U : 10U, valid);
+        value = parse_numeric(digits, hex ? 16U : 10U, valid);
         if (!valid) return 0;
-        append_utf8(output, value);
     } else {
-        const auto* entity = std::lower_bound(std::begin(html_entities), std::end(html_entities), body,
-            [](const Entity& item, std::string_view name) { return item.name < name; });
-        if (entity == std::end(html_entities) || entity->name != body) return 0;
-        append_utf8(output, entity->a);
-        if (entity->count == 2) append_utf8(output, entity->b);
+        const auto* entity = find_entity(body);
+        if (entity == nullptr) return 0;
+        value = entity->a;
+        second = entity->b;
+        count = entity->count;
     }
+    auto* cursor = write_utf8(out, value);
+    if (count == 2) cursor = write_utf8(cursor, second);
+    written = static_cast<std::size_t>(cursor - out);
     return relative + 2;
+}
+
+std::size_t append_entity(std::string_view input, std::string& output) {
+    // The longest entity expands to two code points, so eight bytes always fit.
+    char buffer[8];
+    std::size_t written = 0;
+    const auto consumed = append_entity(input, buffer, written);
+    if (consumed != 0) output.append(buffer, written);
+    return consumed;
 }
 
 std::string unescape_markdown(std::string_view input) {
@@ -162,8 +183,8 @@ LinkLabel scan_link_label(std::string_view input, std::size_t begin) {
     return {};
 }
 
-std::string normalize_reference(std::string_view label) {
-    std::string out;
+void normalize_reference_into(std::string_view label, std::string& out) {
+    out.clear();
     out.reserve(label.size());
     bool pending_space = false;
     for (std::size_t i = 0; i < label.size();) {
@@ -191,6 +212,11 @@ std::string normalize_reference(std::string_view label) {
         }
         i += width;
     }
+}
+
+std::string normalize_reference(std::string_view label) {
+    std::string out;
+    normalize_reference_into(label, out);
     return out;
 }
 

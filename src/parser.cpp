@@ -1,6 +1,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 
@@ -167,11 +168,14 @@ bool fence_close(std::string_view line, std::size_t pos, std::size_t column,
     return i == line.size();
 }
 
-ListMarker parse_list_marker(std::string_view line, std::size_t pos,
-                             std::size_t column, bool interrupting) {
-    ListMarker result;
+// Fills a caller-owned scratch marker rather than returning one. ListMarker is
+// a 64-byte aggregate, and the vast majority of calls reject the line within
+// the first few bytes; only writing it on success keeps those rejects cheap.
+bool parse_list_marker(std::string_view line, std::size_t pos,
+                       std::size_t column, bool interrupting, ListMarker& result) {
+    result.valid = false;
     const auto ind = indentation(line, pos, column);
-    if (ind.columns > 3 || ind.blank) return result;
+    if (ind.columns > 3 || ind.blank) return false;
     auto i = ind.first;
     std::size_t width = 0;
     std::uint32_t start = 1;
@@ -188,16 +192,16 @@ ListMarker parse_list_marker(std::string_view line, std::size_t pos,
             ++i;
         }
         if (i == digits || i - digits > 9 || i == line.size() ||
-            (line[i] != '.' && line[i] != ')')) return result;
+            (line[i] != '.' && line[i] != ')')) return false;
         marker = line[i];
         width = i - digits + 1;
         i = digits;
     } else {
-        return result;
+        return false;
     }
     const auto after_marker = ind.first + width;
-    if (after_marker < line.size() && !ascii_space(line[after_marker])) return result;
-    if (interrupting && kind == ListKind::ordered && start != 1) return result;
+    if (after_marker < line.size() && !ascii_space(line[after_marker])) return false;
+    if (interrupting && kind == ListKind::ordered && start != 1) return false;
 
     auto content = after_marker;
     auto spacing_column = column + ind.columns + width;
@@ -214,7 +218,7 @@ ListMarker parse_list_marker(std::string_view line, std::size_t pos,
         ++content;
     }
     const bool blank = content == line.size();
-    if (interrupting && blank) return result;
+    if (interrupting && blank) return false;
 
     std::size_t padding_spaces = spaces;
     if (spaces == 0 || spaces > 4 || blank) {
@@ -240,7 +244,7 @@ ListMarker parse_list_marker(std::string_view line, std::size_t pos,
     const auto structural_column = column + result.padding;
     result.residual_spaces = actual_column > structural_column ? actual_column - structural_column : 0;
     result.content_blank = blank;
-    return result;
+    return true;
 }
 
 int html_block_start(std::string_view line, std::size_t pos, std::size_t column,
@@ -371,23 +375,81 @@ bool blank_between(std::string_view source, std::size_t begin, std::size_t end) 
     return false;
 }
 
-bool inline_interrupt(std::string_view line, std::size_t pos, std::size_t column) {
+// Characters that can begin a container (block quote or list item). Anything
+// else lets the container loop stop without running the recognizers.
+bool opens_container(char c) noexcept {
+    return c == '>' || c == '*' || c == '-' || c == '_' || c == '+' || (c >= '0' && c <= '9');
+}
+
+// Characters that can begin a leaf block other than an indented code block or
+// a paragraph.
+bool opens_leaf(char c) noexcept {
+    return c == '*' || c == '-' || c == '_' || c == '#' || c == '`' || c == '~' || c == '<';
+}
+
+bool interrupts_at(char c) noexcept {
+    // Every construct that can interrupt a paragraph (block quote, thematic
+    // break, ATX heading, fence, list marker, HTML block) begins with one of
+    // these bytes. Rejecting everything else here keeps ordinary prose out of
+    // five full block recognizers per line.
+    switch (c) {
+    case '>': case '*': case '-': case '_': case '#': case '`': case '~': case '<': case '+':
+        return true;
+    default:
+        return c >= '0' && c <= '9';
+    }
+}
+
+bool inline_interrupt(std::string_view line, std::size_t pos, std::size_t column,
+                      ListMarker& scratch) {
+    const auto ind = indentation(line, pos, column);
+    if (ind.blank || !interrupts_at(line[ind.first])) return false;
     std::uint32_t level = 0;
     std::size_t a = 0, b = 0;
     char marker = 0;
     std::size_t count = 0, indent = 0, info = 0;
-    const auto ind = indentation(line, pos, column);
-    if (ind.columns <= 3 && !ind.blank && line[ind.first] == '>') return true;
+    if (ind.columns <= 3 && line[ind.first] == '>') return true;
     if (thematic_break(line, pos, column)) return true;
     if (atx_heading(line, pos, column, level, a, b)) return true;
     if (fence_open(line, pos, column, marker, count, indent, info)) return true;
-    if (parse_list_marker(line, pos, column, true).valid) return true;
+    if (parse_list_marker(line, pos, column, true, scratch)) return true;
     return html_block_start(line, pos, column, true) != 0;
 }
 
 std::size_t trim_line_end(std::string_view text, std::size_t end) {
     while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t')) --end;
     return end;
+}
+
+// Offset of the next '\n' at or after begin, or text.size() when the rest of
+// the input holds none. Short lines dominate real documents, and for those a
+// byte loop is cheaper than a library search call; long lines fall back to it.
+std::size_t find_newline(std::string_view text, std::size_t begin) noexcept {
+    const auto size = text.size();
+    const auto short_end = std::min(size, begin + 24);
+    auto pos = begin;
+    while (pos < short_end && text[pos] != '\n') ++pos;
+    if (pos < short_end) return pos;
+    if (pos == size) return size;
+    const auto found = text.find('\n', pos);
+    return found == std::string_view::npos ? size : found;
+}
+
+// Advances past a run of '\n' without testing one byte per iteration. Eight
+// bytes are compared per word, and the tail finishes byte by byte. Runs of
+// blank lines are common in machine-generated documents.
+std::size_t skip_newlines(std::string_view text, std::size_t begin) noexcept {
+    constexpr std::uint64_t newlines = 0x0A0A0A0A0A0A0A0AULL;
+    const auto size = text.size();
+    auto pos = begin + 1;
+    while (pos + 8 <= size) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, text.data() + pos, sizeof(word));
+        if (word != newlines) break;
+        pos += 8;
+    }
+    while (pos < size && text[pos] == '\n') ++pos;
+    return pos;
 }
 
 struct TableCellSlice {
@@ -401,6 +463,9 @@ struct TableRowParse {
 };
 
 bool escaped_pipe(std::string_view row, std::size_t offset) noexcept {
+    // A pipe preceded by anything other than a backslash is never escaped, and
+    // that is the overwhelmingly common case.
+    if (offset == 0 || row[offset - 1] != '\\') return false;
     std::size_t slashes = 0;
     while (offset > slashes && row[offset - slashes - 1] == '\\') ++slashes;
     return (slashes & 1U) != 0;
@@ -420,8 +485,10 @@ const TableRowParse& split_table_row(std::string_view row, TableRowParse& result
         result.has_pipe = true;
         cell_begin = begin + 1;
     }
-    for (auto i = row.find('|', cell_begin); i < end; i = row.find('|', i + 1)) {
-        if (escaped_pipe(row, i)) continue;
+    // Table rows are short. Walking the bytes keeps the whole scan in one tight
+    // loop instead of paying a library search call per pipe.
+    for (auto i = cell_begin; i < end; ++i) {
+        if (row[i] != '|' || escaped_pipe(row, i)) continue;
         result.has_pipe = true;
         auto first = cell_begin;
         auto last = i;
@@ -598,11 +665,30 @@ public:
     }
 
     ReferenceMap run() {
-        for (std::size_t begin = 0; begin < source_.size() && builder_.ok();) {
-            const auto newline = source_.find('\n', begin);
-            const auto end = newline == std::string::npos ? source_.size() : newline;
-            const auto next = newline == std::string::npos ? end : end + 1;
+        const auto size = source_.size();
+        std::size_t next_hint = 0;
+        for (std::size_t begin = 0; begin < size && builder_.ok();) {
+            // With only the document open, consecutive empty lines are
+            // idempotent: each one records a pending blank and extends the
+            // root range, so only the last line of a run changes anything.
+            if (source_[begin] == '\n' && open_.size() == 1) {
+                begin = skip_newlines(source_, begin) - 1;
+            }
+            const auto end = find_newline(source_, begin);
+            const auto next = end == size ? end : end + 1;
             process_line({begin, end, next});
+            // Feed the arena a running estimate of its final size. The cap
+            // keeps a short dense prefix (say, a table) from reserving room
+            // for a sparse tail many times its size.
+            if (builder_.nodes().size() >= next_hint) {
+                const auto produced = builder_.nodes().size();
+                if (next >= 4096 && produced > 64) {
+                    const auto extrapolated = static_cast<std::size_t>(
+                        static_cast<double>(produced) * static_cast<double>(size) / static_cast<double>(next));
+                    builder_.set_reserve_hint(std::min(extrapolated, produced * 16) + 32);
+                }
+                next_hint = produced + 64;
+            }
             begin = next;
         }
         close_to(1);
@@ -616,6 +702,17 @@ private:
     void touch_open(std::size_t end) {
         const auto bounded = static_cast<std::uint32_t>(std::min<std::size_t>(end, std::numeric_limits<std::uint32_t>::max()));
         for (const auto id : open_) builder_.get(id).source.end = bounded;
+    }
+
+    // A leaf appended directly to the current tip has depth open_.size(). The
+    // finished-tree walk this replaces used to catch these; enforcing the limit
+    // where the node is created keeps the walk unnecessary.
+    bool leaf_fits() const noexcept {
+        return options_.max_nesting == 0 || open_.size() < options_.max_nesting;
+    }
+
+    void fail_nesting(std::size_t offset) {
+        error_ = {ErrorCode::nesting_limit, offset, "nesting limit exceeded"};
     }
 
     void close_to(std::size_t size) {
@@ -654,6 +751,22 @@ private:
 
     void process_line(const Line& info) {
         const std::string_view line(source_.data() + info.begin, info.end - info.begin);
+
+        // Only the document is open: a blank line has nowhere to close to and
+        // no leaf to continue, so record the pending blank and move on.
+        if (open_.size() == 1) {
+            bool blank = true;
+            for (const char c : line) {
+                if (c != ' ' && c != '\t') { blank = false; break; }
+            }
+            if (blank) {
+                blank_pending_ = true;
+                blank_barrier_ = npos;
+                touch_open(info.next);
+                return;
+            }
+        }
+
         std::size_t pos = 0;
         std::size_t column = 0;
         std::size_t virtual_spaces = 0;
@@ -741,9 +854,9 @@ private:
                 if (builder_.get(id).type == NodeType::item) { affected = id; break; }
                 if (builder_.get(id).type == NodeType::list) {
                     const auto parent = builder_.get(id).parent;
-                    const auto marker = parse_list_marker(line, pos, column, false);
-                    if (parent == npos || builder_.get(parent).type != NodeType::item ||
-                        (marker.valid && same_list(builder_.get(id), marker))) {
+                    const bool same = parse_list_marker(line, pos, column, false, marker_scratch_) &&
+                        same_list(builder_.get(id), marker_scratch_);
+                    if (parent == npos || builder_.get(parent).type != NodeType::item || same) {
                         affected = builder_.get(id).last_child;
                         break;
                     }
@@ -761,8 +874,8 @@ private:
             const auto rest = indentation(line, pos, column);
             bool sibling_list_marker = false;
             if (matched > 0 && builder_.get(open_[matched - 1]).type == NodeType::list)
-                sibling_list_marker = parse_list_marker(line, pos, column, false).valid;
-            if (paragraph != npos && !rest.blank && !inline_interrupt(line, pos, column) && !sibling_list_marker) {
+                sibling_list_marker = parse_list_marker(line, pos, column, false, marker_scratch_);
+            if (paragraph != npos && !rest.blank && !inline_interrupt(line, pos, column, marker_scratch_) && !sibling_list_marker) {
                 auto& p = builder_.get(paragraph);
                 p.literal.push_back('\n');
                 const auto content = rest.columns <= 3 ? rest.first : pos;
@@ -827,7 +940,7 @@ private:
                 const auto content = line.substr(ind.first);
                 const bool reference_definition = !content.empty() && content.front() == '[' &&
                     parse_reference(content).consumed != 0;
-                if (!ind.blank && ind.columns <= 3 && !inline_interrupt(line, pos, column) &&
+                if (!ind.blank && ind.columns <= 3 && !inline_interrupt(line, pos, column, marker_scratch_) &&
                     !reference_definition) {
                     const auto table = open_.back();
                     append_table_body_row(table, content, info.begin + ind.first, info.next);
@@ -867,7 +980,7 @@ private:
                 touch_open(info.next);
                 return;
             }
-            if (!inline_interrupt(line, pos, column)) {
+            if (!inline_interrupt(line, pos, column, marker_scratch_)) {
                 p.literal.push_back('\n');
                 p.literal.append(line.substr(ind.columns <= 3 ? ind.first : pos));
                 touch_open(info.next);
@@ -880,7 +993,8 @@ private:
         bool opened_empty_item = false;
         for (;;) {
             const auto ind = indentation(line, pos, column);
-            if (virtual_spaces + ind.columns <= 3 && !ind.blank && line[ind.first] == '>') {
+            if (ind.blank || !opens_container(line[ind.first])) break;
+            if (virtual_spaces + ind.columns <= 3 && line[ind.first] == '>') {
                 close_incompatible_list();
                 const auto id = builder_.append(open_.back(), NodeType::block_quote,
                     {static_cast<std::uint32_t>(info.begin + ind.first), static_cast<std::uint32_t>(info.next)});
@@ -899,8 +1013,9 @@ private:
             }
 
             if (thematic_break(line, pos, column)) break;
-            const auto marker = parse_list_marker(line, pos, column, false);
-            if (!marker.valid || virtual_spaces + marker.marker_offset > 3) break;
+            const auto& marker = marker_scratch_;
+            if (!parse_list_marker(line, pos, column, false, marker_scratch_) ||
+                virtual_spaces + marker.marker_offset > 3) break;
 
             NodeId list = npos;
             if (builder_.get(open_.back()).type == NodeType::list && same_list(builder_.get(open_.back()), marker)) {
@@ -951,52 +1066,61 @@ private:
 
         const auto source_begin = static_cast<std::uint32_t>(info.begin + ind.first);
         const auto source_end = static_cast<std::uint32_t>(info.next);
-        if (thematic_break(line, pos, column)) {
-            builder_.append(open_.back(), NodeType::thematic_break, {source_begin, source_end});
-            touch_open(info.next);
-            return;
-        }
-
-        std::uint32_t level = 0;
-        std::size_t content_begin = 0, content_end = 0;
-        if (atx_heading(line, pos, column, level, content_begin, content_end)) {
-            const auto id = builder_.append(open_.back(), NodeType::heading, {source_begin, source_end});
-            if (id != npos) {
-                auto& node = builder_.get(id);
-                node.number = level;
-                node.literal.assign(line.substr(content_begin, content_end - content_begin));
+        // Each recognizer below is keyed on its own leading byte, and the
+        // shared indentation is already known, so one character test replaces
+        // four full recognizer calls for ordinary prose lines.
+        const char lead = line[ind.first];
+        if (opens_leaf(lead)) {
+            if (thematic_break(line, pos, column)) {
+                if (!leaf_fits()) { fail_nesting(info.begin + ind.first); return; }
+                builder_.append(open_.back(), NodeType::thematic_break, {source_begin, source_end});
+                touch_open(info.next);
+                return;
             }
-            touch_open(info.next);
-            return;
-        }
 
-        char fence_marker = 0;
-        std::size_t fence_count = 0, fence_indent = 0, info_begin = 0;
-        if (fence_open(line, pos, column, fence_marker, fence_count, fence_indent, info_begin)) {
-            const auto id = builder_.append(open_.back(), NodeType::code_block, {source_begin, source_end});
-            if (id == npos) return;
-            auto& node = builder_.get(id);
-            node.fenced = true;
-            node.marker = fence_marker;
-            node.number = static_cast<std::uint32_t>(fence_count);
-            node.marker_offset = static_cast<std::uint16_t>(fence_indent);
-            const auto info_end = trim_line_end(line, line.size());
-            if (info_begin < info_end) node.title = unescape_markdown(line.substr(info_begin, info_end - info_begin));
-            push_open(id, info.begin + ind.first);
-            touch_open(info.next);
-            return;
-        }
+            std::uint32_t level = 0;
+            std::size_t content_begin = 0, content_end = 0;
+            if (atx_heading(line, pos, column, level, content_begin, content_end)) {
+                if (!leaf_fits()) { fail_nesting(info.begin + ind.first); return; }
+                const auto id = builder_.append(open_.back(), NodeType::heading, {source_begin, source_end});
+                if (id != npos) {
+                    auto& node = builder_.get(id);
+                    node.number = level;
+                    node.literal.assign(line.substr(content_begin, content_end - content_begin));
+                }
+                touch_open(info.next);
+                return;
+            }
 
-        const int html_type = html_block_start(line, pos, column, false);
-        if (html_type != 0) {
-            const auto id = builder_.append(open_.back(), NodeType::html_block, {source_begin, source_end});
-            if (id == npos) return;
-            auto& node = builder_.get(id);
-            node.number = static_cast<std::uint32_t>(html_type);
-            append_line(node, line, pos);
-            if (!html_block_ends(html_type, line)) push_open(id, info.begin + ind.first);
-            touch_open(info.next);
-            return;
+            char fence_marker = 0;
+            std::size_t fence_count = 0, fence_indent = 0, info_begin = 0;
+            if (fence_open(line, pos, column, fence_marker, fence_count, fence_indent, info_begin)) {
+                const auto id = builder_.append(open_.back(), NodeType::code_block, {source_begin, source_end});
+                if (id == npos) return;
+                auto& node = builder_.get(id);
+                node.fenced = true;
+                node.marker = fence_marker;
+                node.number = static_cast<std::uint32_t>(fence_count);
+                node.marker_offset = static_cast<std::uint16_t>(fence_indent);
+                const auto info_end = trim_line_end(line, line.size());
+                if (info_begin < info_end) node.title = unescape_markdown(line.substr(info_begin, info_end - info_begin));
+                push_open(id, info.begin + ind.first);
+                touch_open(info.next);
+                return;
+            }
+
+            const int html_type = html_block_start(line, pos, column, false);
+            if (html_type != 0) {
+                if (!leaf_fits()) { fail_nesting(info.begin + ind.first); return; }
+                const auto id = builder_.append(open_.back(), NodeType::html_block, {source_begin, source_end});
+                if (id == npos) return;
+                auto& node = builder_.get(id);
+                node.number = static_cast<std::uint32_t>(html_type);
+                append_line(node, line, pos);
+                if (!html_block_ends(html_type, line)) push_open(id, info.begin + ind.first);
+                touch_open(info.next);
+                return;
+            }
         }
 
         if (virtual_spaces + ind.columns >= 4) {
@@ -1052,6 +1176,14 @@ private:
         auto header_text = full_text.substr(header_offset);
         const auto& header = split_table_row(header_text, row_scratch_);
         if (!header.has_pipe || header.cells.size() != alignments.size()) return false;
+
+        // A confirmed table adds three levels below the delimiter line
+        // (table -> head -> row -> cell). Checking now avoids building a tree
+        // the finished-tree depth check would have to reject afterwards.
+        if (options_.max_nesting != 0 && open_.size() + 2 >= options_.max_nesting) {
+            fail_nesting(delimiter_begin);
+            return true;
+        }
 
         // A failed candidate must not copy the growing paragraph. Once a table
         // is confirmed, retain only its header while the arena is modified.
@@ -1179,8 +1311,8 @@ private:
             const auto [found, inserted] = references_.try_emplace(std::move(parsed.label), std::move(parsed.reference));
             // Nested containers and setext headings are collected later;
             // document order, not collection order, determines precedence.
-            if (!inserted && parsed.reference.source_offset < found->second.source_offset)
-                found->second = std::move(parsed.reference);
+            if (!inserted && parsed.reference.source_offset < found->source_offset)
+                *found = std::move(parsed.reference);
             consumed += parsed.consumed;
         }
         return consumed;
@@ -1256,6 +1388,7 @@ private:
     NodeId blank_barrier_ = npos;
     ReferenceMap references_;
     TableRowParse row_scratch_;
+    ListMarker marker_scratch_;
     std::vector<TableAlignment> alignments_;
 };
 
@@ -1288,6 +1421,13 @@ bool valid_utf8(std::string_view input, std::size_t& bad_offset) noexcept {
 }
 
 void normalize_input(std::string_view input, std::string& output) {
+    // CR, CRLF and NUL are the only sequences that need rewriting. When none
+    // is present the source can be copied verbatim, which lets the two scans
+    // and the copy run at memory bandwidth instead of byte at a time.
+    if (input.find('\r') == std::string_view::npos && input.find('\0') == std::string_view::npos) {
+        output.assign(input);
+        return;
+    }
     output.clear();
     output.reserve(input.size());
     for (std::size_t i = 0; i < input.size();) {
@@ -1337,14 +1477,11 @@ ParseResult Parser::parse(std::string_view markdown) const {
             builder.compact(1, 0);
             detail::parse_inlines(builder, references, options_);
         }
-        if (!result.error && options_.max_nesting != 0) {
-            detail::walk(result.document, [&](NodeId id, std::size_t depth) {
-                if (depth >= options_.max_nesting && !result.error)
-                    result.error = {ErrorCode::nesting_limit, result.document.node(id).source.begin,
-                                    "nesting limit exceeded"};
-                return !result.error;
-            }, [](NodeId, std::size_t) {});
-        }
+        // Nesting is bounded where nodes are created: the block parser checks
+        // each push_open(), table construction checks its three extra levels,
+        // and inline wrappers check their height whenever the remaining budget
+        // is small enough to matter. A finished-tree walk would only repeat
+        // that work.
         auto& nodes = detail_access::nodes(result.document);
         // Retire a large construction arena when only a small result remains
         // (e.g. reference definitions or unmatched punctuation). Normal trees

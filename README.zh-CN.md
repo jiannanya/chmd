@@ -32,6 +32,7 @@ CHMD_BUILD_TESTS=ON          构建单元、边界和规范测试
 CHMD_BUILD_BENCHMARKS=OFF   构建微基准套件
 CHMD_ENABLE_SANITIZERS=OFF  Linux/macOS 启用 ASan+UBSan；MSVC 启用 ASan；Windows Clang 启用 UBSan
 CHMD_BUILD_FUZZER=OFF       Clang 下构建 libFuzzer 目标
+CHMD_ENABLE_LTO=OFF         工具链支持时启用链接时优化
 ```
 
 ## C++ API

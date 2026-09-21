@@ -67,13 +67,18 @@ NodeId Builder::make(NodeType type, SourceRange source) {
     if (nodes_.size() == nodes_.capacity()) {
         auto capacity = std::max<std::size_t>(8, nodes_.capacity() +
             std::min(nodes_.capacity(), static_cast<std::size_t>(npos) - nodes_.capacity()));
+        if (reserve_hint_ > capacity) capacity = reserve_hint_;
         if (options_.max_nodes != 0) capacity = std::min(capacity, options_.max_nodes);
+        if (capacity < nodes_.size() + 1) capacity = nodes_.size() + 1;
         nodes_.reserve(capacity);
     }
-    nodes_.push_back(Node{});
-    auto id = static_cast<NodeId>(nodes_.size() - 1);
-    nodes_[id].type = type;
-    nodes_[id].source = source;
+    // emplace_back() constructs the node directly in the arena; push_back()
+    // would build a temporary Node (with two strings) and then move it.
+    nodes_.emplace_back();
+    auto& node = nodes_.back();
+    const auto id = static_cast<NodeId>(nodes_.size() - 1);
+    node.type = type;
+    node.source = source;
     return id;
 }
 
@@ -107,6 +112,7 @@ NodeId Builder::insert_after(NodeId sibling, NodeType type) {
 void Builder::unlink(NodeId id) {
     auto& n = nodes_[id];
     if (n.parent == npos) return;
+    ++unlinks_;
     auto& p = nodes_[n.parent];
     if (n.previous != npos) nodes_[n.previous].next = n.next;
     else p.first_child = n.next;

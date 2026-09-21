@@ -1,24 +1,51 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace chmd {
 namespace {
 
+// Every renderer emits small non-negative integers far more often than any
+// other token. Building them in a stack buffer avoids the temporary string
+// (and its allocation) that std::to_string plus operator+ would create.
+void append_uint(std::string& out, std::uint32_t value) {
+    char buffer[10];
+    auto* const end = buffer + sizeof(buffer);
+    auto* pos = end;
+    do {
+        *--pos = static_cast<char>('0' + static_cast<char>(value % 10U));
+        value /= 10U;
+    } while (value != 0);
+    out.append(pos, static_cast<std::size_t>(end - pos));
+}
+
+constexpr std::array<bool, 256> escape_table() {
+    std::array<bool, 256> table{};
+    table[static_cast<unsigned char>('&')] = true;
+    table[static_cast<unsigned char>('<')] = true;
+    table[static_cast<unsigned char>('>')] = true;
+    table[static_cast<unsigned char>('"')] = true;
+    return table;
+}
+
 void append_escaped(std::string& out, std::string_view text, bool attribute = false) {
+    // A 256-entry lookup is a single load per byte; find_first_of() over a
+    // four-character set costs up to four comparisons per byte.
+    static constexpr auto specials = escape_table();
     for (std::size_t begin = 0; begin < text.size();) {
-        const auto special = text.find_first_of("&<>\"", begin);
-        if (special == std::string_view::npos) { out.append(text.substr(begin)); break; }
-        out.append(text.substr(begin, special - begin));
-        const char c = text[special];
-        switch (c) {
+        auto i = begin;
+        while (i < text.size() && !specials[static_cast<unsigned char>(text[i])]) ++i;
+        out.append(text.substr(begin, i - begin));
+        if (i == text.size()) break;
+        switch (text[i]) {
         case '&': out += "&amp;"; break;
         case '<': out += "&lt;"; break;
         case '>': out += "&gt;"; break;
         case '"': out += "&quot;"; break;
-        default: out.push_back(c); break;
+        default: break;
         }
-        begin = special + 1;
+        begin = i + 1;
     }
     (void)attribute;
 }
@@ -150,13 +177,13 @@ private:
         case NodeType::list:
             if (node.list_kind == ListKind::ordered) {
                 out_ += "<ol";
-                if (node.number != 1) out_ += " start=\"" + std::to_string(node.number) + "\"";
+                if (node.number != 1) { out_ += " start=\""; append_uint(out_, node.number); out_ += "\""; }
                 out_ += ">\n";
             } else out_ += "<ul>\n";
             break;
         case NodeType::item: out_ += "<li>"; break;
         case NodeType::thematic_break: out_ += options_.xhtml ? "<hr />\n" : "<hr>\n"; break;
-        case NodeType::heading: out_ += "<h" + std::to_string(node.number) + ">"; break;
+        case NodeType::heading: out_ += "<h"; append_uint(out_, node.number); out_ += ">"; break;
         case NodeType::code_block:
             out_ += "<pre><code";
             if (!node.title.empty()) {
@@ -220,7 +247,7 @@ private:
         case NodeType::block_quote: out_ += "</blockquote>\n"; break;
         case NodeType::list: out_ += node.list_kind == ListKind::ordered ? "</ol>\n" : "</ul>\n"; break;
         case NodeType::item: out_ += "</li>\n"; break;
-        case NodeType::heading: out_ += "</h" + std::to_string(node.number) + ">\n"; break;
+        case NodeType::heading: out_ += "</h"; append_uint(out_, node.number); out_ += ">\n"; break;
         case NodeType::paragraph: if (!tight_paragraph(node)) out_ += "</p>\n"; break;
         case NodeType::table: out_ += "</table>\n"; break;
         case NodeType::table_head: out_ += "</thead>\n"; break;
@@ -249,11 +276,15 @@ void render_ast_enter(const Document& document, NodeId id, std::string& out, std
     if (pretty) out += "\n";
     indent(1); out += "\"type\":"; if (pretty) out += " "; append_json_string(out, node_type_name(node.type));
     out += ","; if (pretty) out += "\n";
-    indent(1); out += "\"source\": [" + std::to_string(node.source.begin) + ", " + std::to_string(node.source.end) + "]";
+    indent(1); out += "\"source\": [";
+    append_uint(out, node.source.begin);
+    out += ", ";
+    append_uint(out, node.source.end);
+    out += "]";
     if (!node.literal.empty()) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"literal\":"; if (pretty) out += " "; append_json_string(out, node.literal); }
     if (!node.title.empty()) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"title\":"; if (pretty) out += " "; append_json_string(out, node.title); }
-    if (node.type == NodeType::heading) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"level\": " + std::to_string(node.number); }
-    if (node.type == NodeType::table) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"columns\": " + std::to_string(node.number); }
+    if (node.type == NodeType::heading) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"level\": "; append_uint(out, node.number); }
+    if (node.type == NodeType::table) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"columns\": "; append_uint(out, node.number); }
     if (node.type == NodeType::table_cell) { out += ","; if (pretty) out += "\n"; indent(1); out += "\"alignment\": "; append_json_string(out, alignment_name(node.alignment)); }
     if (node.type == NodeType::item && node.task) {
         out += ","; if (pretty) out += "\n"; indent(1); out += "\"task\": true,";
@@ -261,9 +292,9 @@ void render_ast_enter(const Document& document, NodeId id, std::string& out, std
     }
     if (node.type == NodeType::list) {
         out += ","; if (pretty) out += "\n"; indent(1);
-        out += "\"list_kind\": \"" + std::string(node.list_kind == ListKind::ordered ? "ordered" : "bullet") + "\",";
-        if (pretty) out += "\n"; indent(1); out += "\"start\": " + std::to_string(node.number) + ",";
-        if (pretty) out += "\n"; indent(1); out += "\"tight\": " + std::string(node.tight ? "true" : "false");
+        out += node.list_kind == ListKind::ordered ? "\"list_kind\": \"ordered\"," : "\"list_kind\": \"bullet\",";
+        if (pretty) out += "\n"; indent(1); out += "\"start\": "; append_uint(out, node.number); out += ",";
+        if (pretty) out += "\n"; indent(1); out += node.tight ? "\"tight\": true" : "\"tight\": false";
     }
     if (node.first_child != npos) {
         out += ","; if (pretty) out += "\n"; indent(1); out += "\"children\": ["; if (pretty) out += "\n";
@@ -283,13 +314,13 @@ void render_ast_leave(const Document& document, NodeId id, std::string& out, std
 }
 
 void append_event_attributes(std::string& out, const Node& node) {
-    if (node.type == NodeType::heading) out += " level=" + std::to_string(node.number);
-    if (node.type == NodeType::table) out += " columns=" + std::to_string(node.number);
+    if (node.type == NodeType::heading) { out += " level="; append_uint(out, node.number); }
+    if (node.type == NodeType::table) { out += " columns="; append_uint(out, node.number); }
     if (node.type == NodeType::table_cell) { out += " alignment="; out += alignment_name(node.alignment); }
     if (node.type == NodeType::item && node.task) out += node.checked ? " task=checked" : " task=unchecked";
     if (node.type == NodeType::list) {
         out += node.list_kind == ListKind::ordered ? " kind=ordered" : " kind=bullet";
-        out += " start=" + std::to_string(node.number);
+        out += " start="; append_uint(out, node.number);
         out += node.tight ? " tight=true" : " tight=false";
     }
     if (node.type == NodeType::link || node.type == NodeType::image) {

@@ -32,6 +32,7 @@ CHMD_BUILD_TESTS=ON          Build unit, boundary, and conformance tests
 CHMD_BUILD_BENCHMARKS=OFF   Build the microbenchmark suite
 CHMD_ENABLE_SANITIZERS=OFF  ASan+UBSan on Linux/macOS; ASan on MSVC; UBSan on Windows Clang
 CHMD_BUILD_FUZZER=OFF       Build the libFuzzer target with Clang
+CHMD_ENABLE_LTO=OFF         Interprocedural optimization when the toolchain supports it
 ```
 
 ## C++ API

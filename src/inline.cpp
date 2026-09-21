@@ -10,6 +10,108 @@ namespace {
 
 constexpr bool ascii_space(char c) noexcept { return c == ' ' || c == '\t'; }
 
+constexpr std::array<bool, 256> make_byte_set(std::string_view bytes) noexcept {
+    std::array<bool, 256> table{};
+    for (const char c : bytes) table[static_cast<unsigned char>(c)] = true;
+    return table;
+}
+
+// Ordinary text runs end on any of these bytes. '~', '!' and the brackets are
+// refined by the scanners below because they only terminate a run
+// conditionally.
+constexpr std::array<bool, 256> make_text_stops(bool strikethrough, bool links_possible) noexcept {
+    auto table = make_byte_set("\\`&<\n*_[]!~");
+    if (!strikethrough) table[static_cast<unsigned char>('~')] = false;
+    if (!links_possible) {
+        table[static_cast<unsigned char>('[')] = false;
+        table[static_cast<unsigned char>(']')] = false;
+        table[static_cast<unsigned char>('!')] = false;
+    }
+    return table;
+}
+
+constexpr auto text_stops_full_strike = make_text_stops(true, true);
+constexpr auto text_stops_full_plain = make_text_stops(false, true);
+constexpr auto text_stops_nolink_strike = make_text_stops(true, false);
+constexpr auto text_stops_nolink_plain = make_text_stops(false, false);
+
+// One inline-block scan answers two questions: what does the arena estimate
+// look like, and does the block need the full inline parser at all. A single
+// classification load per byte replaces the two separate scans (estimator and
+// literal check) that used to walk every block twice. The table is selected
+// per block from the strikethrough option and the link-possibility answer.
+enum ScanBit : std::uint8_t {
+    scan_estimate = 1, // marker that can grow the inline tree
+    scan_literal = 2,  // always needs the inline parser
+    scan_bang = 4,     // '!' before '[' also needs the parser
+};
+
+constexpr std::array<std::uint8_t, 256> make_scan_classes(bool strikethrough, bool links_possible) noexcept {
+    std::array<std::uint8_t, 256> table{};
+    for (const char c : std::string_view("\n*_`")) table[static_cast<unsigned char>(c)] = scan_estimate | scan_literal;
+    if (strikethrough) table[static_cast<unsigned char>('~')] = scan_estimate | scan_literal;
+    for (const char c : std::string_view("\\&<")) table[static_cast<unsigned char>(c)] = scan_literal;
+    if (links_possible) {
+        table[static_cast<unsigned char>('[')] = scan_estimate | scan_literal;
+        table[static_cast<unsigned char>(']')] = scan_literal;
+        table[static_cast<unsigned char>('!')] = scan_bang;
+    } else {
+        table[static_cast<unsigned char>('[')] = scan_estimate;
+    }
+    return table;
+}
+
+constexpr auto scan_classes_full_strike = make_scan_classes(true, true);
+constexpr auto scan_classes_full_plain = make_scan_classes(false, true);
+constexpr auto scan_classes_nolink_strike = make_scan_classes(true, false);
+constexpr auto scan_classes_nolink_plain = make_scan_classes(false, false);
+// Indexed by (links_possible ? 2 : 0) | (strikethrough ? 1 : 0).
+constexpr std::array<std::array<std::uint8_t, 256>, 4> scan_classes_index{
+    scan_classes_nolink_plain, scan_classes_nolink_strike,
+    scan_classes_full_plain, scan_classes_full_strike,
+};
+
+// Markers that contribute to the arena estimate, without the literal bits. A
+// block that already needs the inline parser only has to run this cheap test.
+constexpr std::array<std::uint8_t, 256> make_estimate_classes(bool strikethrough) noexcept {
+    std::array<std::uint8_t, 256> table{};
+    for (const char c : std::string_view("\n*_`[")) table[static_cast<unsigned char>(c)] = 1;
+    if (strikethrough) table[static_cast<unsigned char>('~')] = 1;
+    return table;
+}
+
+constexpr auto estimate_classes_strike = make_estimate_classes(true);
+constexpr auto estimate_classes_plain = make_estimate_classes(false);
+
+// Estimate accounting for every marker in text[pos..). The marker table is a
+// template parameter so its address stays a compile-time constant in this hot
+// loop; the caller passes its own locals by reference.
+template <const std::array<std::uint8_t, 256>& Markers>
+std::size_t account_markers(std::string_view text, std::size_t pos, std::size_t& estimate,
+                            std::array<bool, 3>& possible_opener, bool links_possible,
+                            bool table_cell) {
+    while (pos < text.size()) {
+        const auto c = text[pos];
+        if (!Markers[static_cast<unsigned char>(c)]) { ++pos; continue; }
+        ++pos;
+        if (c == '`' || c == '*' || c == '_' || c == '~') {
+            while (pos < text.size() && text[pos] == c) ++pos;
+        }
+        if (c == '`') { ++estimate; continue; }
+        if (c == '\n') { estimate += 2; continue; }
+        if (c == '[') {
+            // A bracket that opens a link or image is repurposed as the
+            // wrapper itself, so a single slot covers both outcomes.
+            if (links_possible) ++estimate;
+            continue;
+        }
+        auto& opener = possible_opener[c == '*' ? 0 : (c == '_' ? 1 : 2)];
+        opener = opener || (pos < text.size() && !ascii_space(text[pos]) && text[pos] != '\n');
+        if (opener) estimate += table_cell ? 1 : 2;
+    }
+    return pos;
+}
+
 bool escapable(char c) noexcept {
     return (c >= '!' && c <= '/') || (c >= ':' && c <= '@') ||
            (c >= '[' && c <= '`') || (c >= '{' && c <= '~');
@@ -283,12 +385,13 @@ public:
     InlineParser(Builder& builder, const ReferenceMap& references, const ParseOptions& options)
         : builder_(builder), references_(references), options_(options) {}
 
-    void run(NodeId parent, std::string input) {
+    void run(NodeId parent, std::string input, bool links_possible) {
         parent_ = parent;
         input_ = std::move(input);
         delimiters_.clear();
         first_delimiter_ = last_delimiter_ = -1;
         backticks_.clear();
+        backticks_ready_ = false;
         html_cache_ = {};
         next_angle_ = 0;
         last_bracket_ = -1;
@@ -296,16 +399,25 @@ public:
         needs_coalesce_ = false;
         emphasis_openers_ = {};
         strike_openers_ = {};
-        links_possible_ = !references_.empty() || input_.find('(') != std::string::npos;
+        // The estimator already searched the block for a link candidate and
+        // classified its bytes, so the parser reuses those answers instead of
+        // re-scanning the literal.
+        links_possible_ = links_possible;
         const auto first_inline = static_cast<NodeId>(builder_.nodes().size());
         first_inline_ = first_inline;
+        unlinks_before_ = builder_.unlinks();
         block_depth_ = 0;
         for (auto ancestor = parent_; builder_.get(ancestor).parent != npos; ancestor = builder_.get(ancestor).parent)
             ++block_depth_;
         track_depth_ = options_.max_nesting != 0 && options_.max_nesting <= block_depth_ + input_.size() + 1;
         heights_.clear();
         builder_.get(parent_).literal.clear();
-        scan_backticks();
+        // Every block produces at least one node at block_depth_ + 1, so the
+        // leaf depth can be rejected up front when the budget is this tight.
+        if (track_depth_ && !builder_.check_nesting(block_depth_ + 1, source_offset(0))) {
+            std::string{}.swap(input_);
+            return;
+        }
         for (pos_ = 0; pos_ < input_.size() && builder_.ok();) {
             const char c = input_[pos_];
             if (c == '\\') parse_backslash();
@@ -326,7 +438,9 @@ public:
             if (needs_coalesce_ || std::any_of(delimiters_.begin(), delimiters_.end(), [&](const Delimiter& delimiter) {
                 return builder_.get(delimiter.node).parent != npos;
             })) coalesce_text(first_inline);
-            builder_.compact(first_inline, parent_);
+            // Detached nodes are the only reason to compact. Blocks that never
+            // unlink anything (plain text, code spans, autolinks) skip the scan.
+            if (builder_.unlinks() != unlinks_before_) builder_.compact(first_inline, parent_);
         }
         // Input ownership comes from the block; its capacity is never reused
         // when the next block is moved in, so retire it before other blocks.
@@ -418,12 +532,19 @@ private:
         return id;
     }
 
-    void scan_backticks() {
-        for (std::size_t i = 0; i < input_.size();) {
-            if (input_[i] != '`') { ++i; continue; }
+    // Collect every backtick run at or after `from` the first time a code span
+    // is attempted. Runs before `from` can never close a span opened at or
+    // after it, so the scan stays correct while skipping blocks that never use
+    // backticks at all.
+    void ensure_backticks(std::size_t from) {
+        if (backticks_ready_) return;
+        backticks_ready_ = true;
+        auto i = input_.find('`', from);
+        while (i != std::string::npos) {
             const auto begin = i;
             while (i < input_.size() && input_[i] == '`') ++i;
             backticks_.emplace_back(i - begin, begin);
+            i = input_.find('`', i);
         }
         std::sort(backticks_.begin(), backticks_.end());
     }
@@ -446,6 +567,7 @@ private:
         const auto begin = pos_;
         while (pos_ < input_.size() && input_[pos_] == '`') ++pos_;
         const auto run = pos_ - begin;
+        ensure_backticks(begin);
         const auto match = std::upper_bound(backticks_.begin(), backticks_.end(), std::pair(run, begin));
         if (match == backticks_.end() || match->first != run) {
             append_node(NodeType::text, std::string_view(input_).substr(begin, run), begin, pos_, false);
@@ -466,9 +588,12 @@ private:
     }
 
     void parse_entity() {
-        std::string decoded;
-        if (const auto consumed = append_entity(std::string_view(input_).substr(pos_), decoded)) {
-            append_node(NodeType::text, decoded, pos_, pos_ + consumed);
+        // Entities expand to at most two code points; decoding into a stack
+        // buffer keeps the common path free of temporary strings.
+        char decoded[8];
+        std::size_t written = 0;
+        if (const auto consumed = append_entity(std::string_view(input_).substr(pos_), decoded, written)) {
+            append_node(NodeType::text, std::string_view(decoded, written), pos_, pos_ + consumed);
             pos_ += consumed;
             return;
         }
@@ -655,12 +780,14 @@ private:
                 label = shortcut_label();
             }
             if (!label.empty() && label.size() <= 999 * 4) {
-                const auto found = references_.find(normalize_reference(label));
-                if (found != references_.end()) {
+                // Normalizing in place keeps the probe allocation-free; the
+                // scratch string keeps its capacity across lookups.
+                normalize_reference_into(label, label_scratch_);
+                if (const auto* found = references_.find(label_scratch_)) {
                     tail.valid = true;
                     tail.end = reference_end;
-                    tail.destination = found->second.destination;
-                    tail.title = found->second.title;
+                    tail.destination = found->destination;
+                    tail.title = found->title;
                 }
             }
         }
@@ -674,15 +801,17 @@ private:
         const auto opener_node = opener.node;
         const auto first = builder_.get(opener_node).next;
         const auto last = builder_.get(parent_).last_child;
-        const auto wrapper = builder_.insert_after(opener_node, opener.image ? NodeType::image : NodeType::link);
-        if (wrapper == npos) return;
-        auto& node = builder_.get(wrapper);
+        // The bracket's own text node becomes the wrapper. Reusing it instead
+        // of inserting a second node and unlinking this one keeps the arena
+        // hole-free, which matters because the block is compacted at the end.
+        auto& node = builder_.get(opener_node);
+        node.type = opener.image ? NodeType::image : NodeType::link;
+        node.marker = 0;
         node.literal = std::move(tail.destination);
         node.title = std::move(tail.title);
         node.source = {source_offset(opener.source_pos), source_offset(tail.end)};
-        if (!check_span(wrapper, first, last == opener_node ? npos : last)) return;
-        if (first != npos && last != opener_node) builder_.move_range(first, last, wrapper);
-        builder_.unlink(opener_node);
+        if (!check_span(opener_node, first, last == opener_node ? npos : last)) return;
+        if (first != npos && last != opener_node) builder_.move_range(first, last, opener_node);
 
         for (auto i = opener_index; i >= 0;) {
             const auto next = delimiters_[static_cast<std::size_t>(i)].next;
@@ -768,17 +897,32 @@ private:
             const auto last = builder_.get(closer.node).previous;
             const auto wrapper_type = closer.character == '~' ? NodeType::strikethrough :
                 (use == 2 ? NodeType::strong : NodeType::emphasis);
-            const auto wrapper = builder_.insert_after(opener.node, wrapper_type);
-            if (wrapper == npos) return;
-            builder_.get(wrapper).source = {builder_.get(opener.node).source.end - static_cast<std::uint32_t>(use),
-                                            builder_.get(closer.node).source.begin + static_cast<std::uint32_t>(use)};
-            builder_.get(opener.node).source.end -= static_cast<std::uint32_t>(use);
-            builder_.get(closer.node).source.begin += static_cast<std::uint32_t>(use);
+            NodeId wrapper = npos;
+            if (opener_empty) {
+                // A fully consumed opener text node becomes the wrapper in
+                // place. Reusing it adds no arena slot and leaves no hole for
+                // the block compaction pass to move.
+                auto& wrapper_node = builder_.get(opener.node);
+                wrapper_node.type = wrapper_type;
+                wrapper_node.marker = 0;
+                wrapper_node.source = {builder_.get(opener.node).source.end - static_cast<std::uint32_t>(use),
+                                       builder_.get(closer.node).source.begin + static_cast<std::uint32_t>(use)};
+                builder_.get(closer.node).source.begin += static_cast<std::uint32_t>(use);
+                wrapper = opener.node;
+            } else {
+                // A partially consumed opener keeps its remaining markers and
+                // needs a separate wrapper node alongside it.
+                wrapper = builder_.insert_after(opener.node, wrapper_type);
+                if (wrapper == npos) return;
+                builder_.get(wrapper).source = {builder_.get(opener.node).source.end - static_cast<std::uint32_t>(use),
+                                                builder_.get(closer.node).source.begin + static_cast<std::uint32_t>(use)};
+                builder_.get(opener.node).source.end -= static_cast<std::uint32_t>(use);
+                builder_.get(closer.node).source.begin += static_cast<std::uint32_t>(use);
+            }
             if (!check_span(wrapper, first == closer.node ? npos : first, last)) return;
             if (first != closer.node && first != npos && last != opener.node) builder_.move_range(first, last, wrapper);
             while (opener.next != current) remove_delimiter(opener.next);
             if (opener_empty) {
-                builder_.unlink(opener.node);
                 remove_delimiter(opener_index);
             }
             if (closer_empty) {
@@ -789,16 +933,32 @@ private:
         }
     }
 
-    void parse_text_run() {
+    // Four tables cover the strikethrough and link-possibility combinations.
+    // Selecting the table with a template keeps its address a compile-time
+    // constant inside the scan loop.
+    template <const std::array<bool, 256>& Stops>
+    void parse_text_run_impl() {
         const auto begin = pos_;
         while (pos_ < input_.size()) {
-            const char c = input_[pos_];
-            if (c == '\\' || c == '`' || c == '&' || c == '<' || c == '\n' || c == '*' ||
-                c == '_' || (c == '~' && options_.extensions.strikethrough) || c == '[' || c == ']' ||
-                (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '[')) break;
-            ++pos_;
+            const auto c = input_[pos_];
+            if (!Stops[static_cast<unsigned char>(c)]) { ++pos_; continue; }
+            // '!' only ends a run when it opens an image bracket; otherwise it
+            // is an ordinary character, exactly as the caller assumed.
+            if (c == '!' && (pos_ + 1 >= input_.size() || input_[pos_ + 1] != '[')) { ++pos_; continue; }
+            break;
         }
         append_node(NodeType::text, std::string_view(input_).substr(begin, pos_ - begin), begin, pos_);
+    }
+
+    void parse_text_run() {
+        if (links_possible_) {
+            if (options_.extensions.strikethrough) parse_text_run_impl<text_stops_full_strike>();
+            else parse_text_run_impl<text_stops_full_plain>();
+        } else if (options_.extensions.strikethrough) {
+            parse_text_run_impl<text_stops_nolink_strike>();
+        } else {
+            parse_text_run_impl<text_stops_nolink_plain>();
+        }
     }
 
     Builder& builder_;
@@ -811,9 +971,11 @@ private:
     std::array<HtmlScanCache, 6> html_cache_{};
     bool needs_coalesce_ = false;
     bool links_possible_ = false;
+    bool backticks_ready_ = false;
     std::array<bool, 2> emphasis_openers_{};
     std::array<bool, 2> strike_openers_{};
     bool track_depth_ = false;
+    std::size_t unlinks_before_ = 0;
     NodeId first_inline_ = 0;
     std::size_t block_depth_ = 0;
     std::vector<std::uint32_t> heights_;
@@ -823,6 +985,7 @@ private:
     int inactive_link_before_ = -1;
     std::vector<Delimiter> delimiters_;
     std::vector<std::pair<std::size_t, std::size_t>> backticks_;
+    std::string label_scratch_;
 };
 
 } // namespace
@@ -832,51 +995,102 @@ void parse_inlines(Builder& builder, const ReferenceMap& references,
     const auto initial_size = builder.nodes().size();
     // Estimate from actual inline-bearing blocks. Empty lines and raw/code
     // blocks reserve no inline arena, and ordinary multiline prose stays tight.
+    // The same scan also records which blocks can skip the inline parser, so no
+    // block is walked twice.
     std::size_t estimate = initial_size;
-    for (const auto& node : builder.nodes()) {
+    // The scan stores its per-block answers in Node::marker, which is unused
+    // for paragraphs, headings and table cells until inline parsing assigns
+    // markers to the text nodes it creates. Bit 0: the block is literal-only
+    // (skip the inline parser). Bit 1: a link can form somewhere in the block
+    // (the answer the parser would otherwise re-derive with its own scan).
+    for (NodeId id = 1; id < initial_size; ++id) {
+        auto& node = builder.get(id);
         if (node.type != NodeType::paragraph && node.type != NodeType::heading && node.type != NodeType::table_cell) continue;
         ++estimate;
         const std::string_view text(node.literal);
         const bool links_possible = !references.empty() || text.find('(') != std::string_view::npos;
+        const bool strikethrough = options.extensions.strikethrough;
+        const bool table_cell = node.type == NodeType::table_cell;
+        const auto& classes = scan_classes_index[(links_possible ? 2U : 0U) + (strikethrough ? 1U : 0U)];
         std::array<bool, 3> possible_opener{};
-        for (auto pos = text.find_first_of("\n*_~[`"); pos != std::string_view::npos;) {
-            const char marker = text[pos];
+        bool plain = true;
+        std::size_t pos = 0;
+        // Count the estimate contribution of the marker at text[pos] and step
+        // past it (including the whole marker run where runs matter).
+        const auto account_marker = [&](char c) {
             ++pos;
-            if (marker == '*' || marker == '_' || marker == '~' || marker == '`')
-                while (pos < text.size() && text[pos] == marker) ++pos;
-            bool count = marker != '[' || links_possible;
-            if (marker == '*' || marker == '_' || marker == '~') {
-                auto& opener = possible_opener[marker == '*' ? 0 : (marker == '_' ? 1 : 2)];
-                opener = opener || (pos < text.size() && !ascii_space(text[pos]) && text[pos] != '\n');
-                count = opener && (marker != '~' || options.extensions.strikethrough);
+            if (c == '`' || c == '*' || c == '_' || c == '~') {
+                while (pos < text.size() && text[pos] == c) ++pos;
             }
-            if (count) estimate += marker == '`' || (node.type == NodeType::table_cell && marker != '\n' && marker != '[') ? 1 : 2;
-            pos = text.find_first_of("\n*_~[`", pos);
+            if (c == '`') { ++estimate; return; }
+            if (c == '\n') { estimate += 2; return; }
+            if (c == '[') {
+                if (links_possible) ++estimate;
+                return;
+            }
+            auto& opener = possible_opener[c == '*' ? 0 : (c == '_' ? 1 : 2)];
+            opener = opener || (pos < text.size() && !ascii_space(text[pos]) && text[pos] != '\n');
+            if (opener) estimate += table_cell ? 1 : 2;
+        };
+        // Phase 1 classifies bytes until one forces the inline parser while
+        // counting markers. A literal-only block is fully covered here by one
+        // pass; no second walk over the same text is needed.
+        while (pos < text.size()) {
+            const auto c = text[pos];
+            const auto cls = classes[static_cast<unsigned char>(c)];
+            if (cls & scan_literal) { plain = false; break; }
+            if (cls & scan_bang && pos + 1 < text.size() && text[pos + 1] == '[') { plain = false; break; }
+            if (cls & scan_estimate) account_marker(c);
+            else ++pos;
         }
+        // Phase 2: the remainder of a non-plain block only needs the marker
+        // bit, so ordinary bytes cost a single load and test.
+        if (!plain) {
+            pos = strikethrough
+                ? account_markers<estimate_classes_strike>(text, pos, estimate, possible_opener, links_possible, table_cell)
+                : account_markers<estimate_classes_plain>(text, pos, estimate, possible_opener, links_possible, table_cell);
+        }
+        node.marker = plain ? static_cast<char>(1 | (links_possible ? 2 : 0))
+                            : (links_possible ? 2 : 0);
     }
     estimate = std::min(estimate, static_cast<std::size_t>(npos - 1));
     if (options.max_nodes != 0) estimate = std::min(estimate, options.max_nodes);
-    builder.nodes().reserve(estimate);
+    // The estimate rarely falls short by more than a handful of wrappers, but a
+    // shortfall at the last block reallocates the whole arena. A small
+    // proportional slack avoids that final move without inflating retained
+    // capacity; the constant term keeps tiny documents from rounding up.
+    auto target = std::min(estimate + 16 + estimate / 256, static_cast<std::size_t>(npos - 1));
+    if (options.max_nodes != 0) target = std::min(target, options.max_nodes);
+    builder.nodes().reserve(target);
     InlineParser parser(builder, references, options);
     for (NodeId id = 1; id < initial_size && builder.ok(); ++id) {
-        const auto type = builder.get(id).type;
+        auto& node = builder.get(id);
+        const auto type = node.type;
         if ((type == NodeType::paragraph || type == NodeType::heading || type == NodeType::table_cell) &&
-            builder.get(id).parent != npos) {
-            auto literal = std::move(builder.get(id).literal);
-            const auto specials = options.extensions.strikethrough ? "\\`&<\n*_[]!~" : "\\`&<\n*_[]!";
-            if (literal.find_first_of(specials) == std::string::npos) {
+            node.parent != npos) {
+            const auto flags = static_cast<std::uint8_t>(node.marker);
+            node.marker = 0;
+            auto literal = std::move(node.literal);
+            if (flags & 1) {
                 // A literal-only block needs one text node and no parser
                 // scratch state. Transfer ownership instead of copying it.
-                const auto begin = builder.get(id).source.begin;
+                const auto begin = node.source.begin;
                 const auto end = static_cast<std::uint32_t>(std::min<std::size_t>(
                     static_cast<std::size_t>(begin) + literal.size(), std::numeric_limits<std::uint32_t>::max()));
                 while (!literal.empty() && (literal.back() == ' ' || literal.back() == '\t')) literal.pop_back();
                 if (!literal.empty()) {
-                    const auto text = builder.append(id, NodeType::text, {begin, end});
-                    if (text != npos) builder.get(text).literal = std::move(literal);
+                    // The text leaf sits one level below the block; reject it
+                    // here so the finished-tree depth walk stays unnecessary.
+                    std::size_t depth = 1;
+                    for (auto ancestor = builder.get(id).parent; builder.get(ancestor).parent != npos;
+                         ancestor = builder.get(ancestor).parent) ++depth;
+                    if (builder.check_nesting(depth + 1, begin)) {
+                        const auto text = builder.append(id, NodeType::text, {begin, end});
+                        if (text != npos) builder.get(text).literal = std::move(literal);
+                    }
                 }
             } else {
-                parser.run(id, std::move(literal));
+                parser.run(id, std::move(literal), (flags & 2) != 0);
             }
         }
     }
