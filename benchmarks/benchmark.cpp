@@ -48,6 +48,12 @@ std::string repeated(std::string_view unit, std::size_t bytes) {
     while (out.size() < bytes) out += unit;
     return out;
 }
+std::string repeat_n(std::string_view unit, std::size_t count) {
+    std::string out;
+    out.reserve(unit.size() * count);
+    for (std::size_t i = 0; i < count; ++i) out += unit;
+    return out;
+}
 void measure(std::string_view name, const std::string& input, int rounds, chmd::ParseOptions options = {}) {
     { auto warm = chmd::Parser(options).parse(input); if (!warm) std::exit(1); }
     std::size_t checksum = 0;
@@ -122,4 +128,109 @@ int main(int argc, char** argv) {
     unlimited.max_nesting = 0;
     measure("nested_images", repeated("![", 24000) + "x" + repeated("](u)", 48000), rounds, unlimited);
     measure("nested_emphasis", repeated("*a ", 36000) + "x" + repeated(" b*", 36000), rounds, unlimited);
+
+    // --- Extended coverage: structure, tables, inline features, HTML blocks,
+    // references, rendering, UTF-8 and list-specific workloads. ---
+
+    // Structure (width/depth).
+    measure("deep_blockquote", repeat_n("> ", 500) + "deep\n", rounds);
+    measure("deep_list", repeat_n("- ", 400) + "deep\n", rounds);
+    {
+        std::string wide_list;
+        for (int i = 0; i < 10000; ++i) { wide_list += "- item "; wide_list += std::to_string(i); wide_list += "\n"; }
+        measure("wide_list", wide_list, rounds);
+    }
+    measure("many_paragraphs", repeat_n("Paragraph text here for benchmarking.\n\n", 10000), rounds);
+    measure("sparse_inline_tail", std::string(mib / 4, 'a') + " *tail emphasis* \n", rounds);
+
+    // Tables.
+    {
+        std::string wide_table = "|";
+        std::string separator = "|";
+        for (int c = 0; c < 200; ++c) { wide_table += " c" + std::to_string(c) + " |"; separator += " - |"; }
+        wide_table += "\n" + separator + "\n";
+        for (int r = 0; r < 50; ++r) {
+            wide_table += "|";
+            for (int c = 0; c < 200; ++c) wide_table += " v |";
+            wide_table += "\n";
+        }
+        measure("wide_table", wide_table, rounds);
+    }
+    measure("many_small_tables", repeat_n("| a | b |\n| - | - |\n| c | d |\n\n", 500), rounds);
+
+    // Inline-heavy.
+    measure("autolinks", repeated("<https://example.com/a/b/c> ", mib), rounds);
+    measure("raw_html_tags", repeated("<span class=\"x\">text</span> ", mib), rounds);
+    measure("backslash_escapes", repeated("\\*\\_\\`\\[\\]\\(\\)\\! ", mib), rounds);
+    measure("long_link", "[text](<" + std::string(65536, 'a') + "> \"" + std::string(1024, 't') + "\")\n", rounds);
+    measure("many_images", repeated("![alt text here](https://example.com/img.png) ", mib), rounds);
+    measure("hard_breaks", repeated("line ends with break  \n", mib), rounds);
+    measure("cjk_emphasis", repeated("\xE4\xB8\xAD\xE6\x96\x87**\xE5\x8A\xA0\xE7\xB2\x97**\xE4\xB8\x8E*\xE5\xBC\xBA\xE8\xB0\x83* ", mib), rounds);
+    measure("nested_emphasis_valid", repeat_n("*", 300) + "word" + repeat_n("*", 300) + "\n", rounds);
+
+    // Realistic mixed workload.
+    {
+        const std::string readme_unit =
+            "# Project Title\n\n"
+            "This project does a thing. See the [documentation](https://example.com/docs) for details.\n\n"
+            "## Features\n\n"
+            "- Fast\n- Small\n- Portable\n\n"
+            "## Example\n\n"
+            "```cpp\nint main() { return 0; }\n```\n\n"
+            "| Option | Default |\n| - | - |\n| `verbose` | false |\n\n";
+        measure("readme_mixed", repeat_n(readme_unit, 300), rounds);
+    }
+
+    // HTML blocks.
+    measure("html_block_pre", "<pre>\n" + repeated("html body content line\n", mib) + "</pre>\n", rounds);
+    measure("html_block_div", "<div>\n" + repeated("<p>content</p>\n", mib) + "</div>\n", rounds);
+
+    // References.
+    measure("reference_reuse", "[r0]: /a\n[r1]: /b\n[r2]: /c\n[r3]: /d\n[r4]: /e\n\n" +
+        repeated("[r0] [r1] [r2] [r3] [r4] ", mib), rounds);
+    measure("forward_references", repeated("[r0] [r1] [r2] ", mib / 2) +
+        "\n[r0]: /a\n[r1]: /b\n[r2]: /c\n", rounds);
+
+    // Rendering / traversal.
+    {
+        const std::string attributes_unit =
+            "1. ordered item\n2. another\n\n"
+            "- [x] done\n- [ ] todo\n\n"
+            "| a | b |\n| :- | -: |\n| x | y |\n\n";
+        measure("attributes_heavy", repeat_n(attributes_unit, 3000), rounds);
+    }
+    measure("tiny_doc_overhead", "# Hi\n\nSmall paragraph with *em* and a [link](/u).\n", rounds * 500);
+
+    // UTF-8 / encoding.
+    measure("astral_heavy", repeated("\xF0\x9F\x98\x80\xF0\x9F\x8E\x89\xF0\x9F\x9A\x80\xF0\x9F\x8C\x9F ", mib), rounds);
+    {
+        chmd::ParseOptions validate_opts;
+        validate_opts.validate_utf8 = true;
+        measure("utf8_validation",
+                repeated("\xE4\xB8\xAD\xE6\x96\x87\xE6\xAE\xB5\xE8\x90\xBD\xE4\xB8\x8E\x20"
+                         "\x55\x6E\x69\x63\x6F\x64\x65\x20\xE7\xAC\xA6\xE5\x8F\xB7\x20\xF0\x9F\x98\x80\xE3\x80\x82", mib),
+                rounds, validate_opts);
+    }
+
+    // Lists.
+    {
+        std::string ordered_big = "999999999. start\n";
+        for (int i = 0; i < 10000; ++i) ordered_big += "1. item\n";
+        measure("ordered_list_renumber", ordered_big, rounds);
+    }
+    measure("tight_loose_alternating", repeat_n("- a\n- b\n\n- c\n\n- d\n\n\n", 2000), rounds);
+
+    // Line endings / misc block features.
+    measure("crlf_heavy", repeated("Ordinary prose with a short line.\r\n", mib), rounds);
+    measure("thematic_setext_flood", repeat_n("Heading\n-------\n\n***\n\n", 5000), rounds);
+    {
+        std::string tasks;
+        for (int i = 0; i < 10000; ++i) {
+            tasks += (i % 2 == 0 ? "- [x] done " : "- [ ] todo ");
+            tasks += std::to_string(i);
+            tasks += "\n";
+        }
+        measure("task_list_flood", tasks, rounds);
+    }
+    measure("empty_blockquote_run", repeat_n(">\n", 50000), rounds);
 }

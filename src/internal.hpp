@@ -107,14 +107,14 @@ public:
     Builder(Document& document, const ParseOptions& options, ParseError& error)
         : nodes_(detail_access::nodes(document)), options_(options), error_(error) {}
 
-    NodeId append(NodeId parent, NodeType type, SourceRange source = {});
-    NodeId insert_after(NodeId sibling, NodeType type);
-    void unlink(NodeId id);
-    void set_children(NodeId parent, NodeId first, NodeId last);
-    void move_range(NodeId first, NodeId last, NodeId new_parent);
-    void remove_if_empty(NodeId id);
+    inline NodeId append(NodeId parent, NodeType type, SourceRange source = {});
+    inline NodeId insert_after(NodeId sibling, NodeType type);
+    inline void unlink(NodeId id);
+    inline void set_children(NodeId parent, NodeId first, NodeId last);
+    inline void move_range(NodeId first, NodeId last, NodeId new_parent);
+    inline void remove_if_empty(NodeId id);
     void compact(NodeId begin, NodeId parent);
-    bool check_nesting(std::size_t depth, std::size_t offset);
+    inline bool check_nesting(std::size_t depth, std::size_t offset);
 
     Node& get(NodeId id) noexcept { return nodes_[id]; }
     const Node& get(NodeId id) const noexcept { return nodes_[id]; }
@@ -138,6 +138,90 @@ private:
     std::size_t unlinks_ = 0;
     std::size_t reserve_hint_ = 0;
 };
+
+// Definitions kept out-of-class (but inline) so the declarations above stay
+// readable; both parser.cpp and inline.cpp call append() once per AST node,
+// so letting it inline into its callers removes a call/ABI boundary from the
+// single hottest path in the library. make()'s rare capacity-growth branch
+// and the larger compact() stay out-of-line in document.cpp so this header
+// doesn't pull cold code into every translation unit that includes it.
+
+inline NodeId Builder::append(NodeId parent, NodeType type, SourceRange source) {
+    const auto id = make(type, source);
+    if (id == npos) return id;
+    auto& p = nodes_[parent];
+    auto& n = nodes_[id];
+    n.parent = parent;
+    n.previous = p.last_child;
+    if (p.last_child != npos) nodes_[p.last_child].next = id;
+    else p.first_child = id;
+    p.last_child = id;
+    return id;
+}
+
+inline NodeId Builder::insert_after(NodeId sibling, NodeType type) {
+    const auto id = make(type, nodes_[sibling].source);
+    if (id == npos) return id;
+    auto& s = nodes_[sibling];
+    auto& n = nodes_[id];
+    n.parent = s.parent;
+    n.previous = sibling;
+    n.next = s.next;
+    if (s.next != npos) nodes_[s.next].previous = id;
+    else nodes_[s.parent].last_child = id;
+    s.next = id;
+    return id;
+}
+
+inline void Builder::unlink(NodeId id) {
+    auto& n = nodes_[id];
+    if (n.parent == npos) return;
+    ++unlinks_;
+    auto& p = nodes_[n.parent];
+    if (n.previous != npos) nodes_[n.previous].next = n.next;
+    else p.first_child = n.next;
+    if (n.next != npos) nodes_[n.next].previous = n.previous;
+    else p.last_child = n.previous;
+    n.parent = npos;
+    n.previous = npos;
+    n.next = npos;
+}
+
+inline void Builder::set_children(NodeId parent, NodeId first, NodeId last) {
+    auto& p = nodes_[parent];
+    p.first_child = first;
+    p.last_child = last;
+    if (first == npos) return;
+    nodes_[first].previous = npos;
+    nodes_[last].next = npos;
+    for (auto id = first; id != npos; id = nodes_[id].next) {
+        nodes_[id].parent = parent;
+        if (id == last) break;
+    }
+}
+
+inline void Builder::move_range(NodeId first, NodeId last, NodeId new_parent) {
+    const auto old_parent = nodes_[first].parent;
+    const auto before = nodes_[first].previous;
+    const auto after = nodes_[last].next;
+    if (before != npos) nodes_[before].next = after;
+    else nodes_[old_parent].first_child = after;
+    if (after != npos) nodes_[after].previous = before;
+    else nodes_[old_parent].last_child = before;
+    nodes_[first].previous = npos;
+    nodes_[last].next = npos;
+    set_children(new_parent, first, last);
+}
+
+inline void Builder::remove_if_empty(NodeId id) {
+    if (nodes_[id].literal.empty() && nodes_[id].first_child == npos) unlink(id);
+}
+
+inline bool Builder::check_nesting(std::size_t depth, std::size_t offset) {
+    if (ok() && options_.max_nesting != 0 && depth >= options_.max_nesting)
+        error_ = {ErrorCode::nesting_limit, offset, "nesting limit exceeded"};
+    return ok();
+}
 
 bool valid_utf8(std::string_view input, std::size_t& bad_offset) noexcept;
 void normalize_input(std::string_view input, std::string& output);
